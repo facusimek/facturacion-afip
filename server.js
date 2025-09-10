@@ -15,7 +15,7 @@ const SHEET_NAME = process.env.SHEET_NAME || 'Hoja 1';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-const AFIP_CUIT = Number(process.env.AFIP_CUIT || '20409378472'); // CUIT test por defecto
+const AFIP_CUIT = Number(process.env.AFIP_CUIT || '20409378472'); // CUIT test por defecto (homologación)
 const AFIP_PROD = String(process.env.AFIP_PROD || 'false') === 'true';
 const AFIP_PTO_VTA = Number(process.env.AFIP_PTO_VTA || '1');
 const AFIP_CBTE_TIPO = Number(process.env.AFIP_CBTE_TIPO || '11'); // 11 = Factura C
@@ -43,6 +43,17 @@ function logError(prefix, e) {
   const msg = humanError(e);
   console.error(`[${prefix}]`, msg, e?.stack ? `\nSTACK:\n${e.stack}` : '');
   return msg;
+}
+
+function toYYYYMMDD(dateStr) {
+  // dateStr esperado: YYYY-MM-DD (columna 'fecha' de la planilla)
+  const d = dateStr ? new Date(dateStr) : new Date();
+  const isValid = !isNaN(d.getTime());
+  const dd = isValid ? d : new Date();
+  const y = dd.getFullYear();
+  const m = String(dd.getMonth() + 1).padStart(2, '0');
+  const day = String(dd.getDate()).padStart(2, '0');
+  return `${y}${m}${day}`;
 }
 
 // ====== GOOGLE SHEETS CLIENT ======
@@ -85,7 +96,7 @@ app.get('/diag/sheets', async (_, res) => {
       cliente_nombre: 'TEST',
       doc_tipo: 'DNI',
       doc_nro: '12345678',
-      concepto: 2,
+      concepto: 2, // Servicios
       detalle: 'ping',
       total: 1,
       pto_vta: AFIP_PTO_VTA,
@@ -130,7 +141,7 @@ function parseMessage(text) {
     cliente_nombre: nombre,
     doc_tipo,
     doc_nro,
-    concepto: 2, // Servicios
+    concepto: 2, // *** Solo servicios por defecto ***
     detalle,
     total,
     pto_vta: AFIP_PTO_VTA,
@@ -161,7 +172,7 @@ async function appendRow(row) {
 
 function docTipoCode(t) { return String(t).toUpperCase() === 'CUIT' ? 80 : 96; } // 80=CUIT, 96=DNI
 
-// ====== NUEVO: Condición IVA del receptor ======
+// ====== Condición IVA del receptor ======
 // IDs comunes: 1=RI, 6=Monotributo, 4=Exento, 5=Consumidor Final, 7=No Categorizado, 15=No Alcanzado
 function getCondicionIVAReceptorId(parsed) {
   if (parsed.doc_tipo === 'DNI') return 5; // Consumidor Final para DNI
@@ -171,17 +182,17 @@ function getCondicionIVAReceptorId(parsed) {
 }
 
 async function emitirFactura(row) {
-  const ahora = new Date();
-  const yyyymmdd = `${ahora.getFullYear()}${String(ahora.getMonth()+1).padStart(2,'0')}${String(ahora.getDate()).padStart(2,'0')}`;
+  // Fecha del comprobante y fechas de servicio (obligatorias para Concepto 2 o 3)
+  const cbteFch = toYYYYMMDD(row.fecha);
 
   const data = {
     CantReg: 1,
     PtoVta: Number(row.pto_vta),
     CbteTipo: Number(row.cbte_tipo),   // 11 = Factura C
-    Concepto: Number(row.concepto),    // 1 Prod, 2 Serv, 3 Ambos
+    Concepto: Number(row.concepto),    // 2 = Servicios (por defecto)
     DocTipo: docTipoCode(row.doc_tipo),
     DocNro: Number(row.doc_nro),
-    CbteFch: yyyymmdd,
+    CbteFch: cbteFch,
     ImpTotal: Number(row.total),
     ImpTotConc: 0,
     ImpNeto: Number(row.total),
@@ -190,11 +201,26 @@ async function emitirFactura(row) {
     MonId: 'PES',
     MonCotiz: 1,
     Iva: [],
-    // Campo requerido por RG 5616:
     CondicionIVAReceptorId: getCondicionIVAReceptorId(row)
   };
 
-  console.log('Usando CondicionIVAReceptorId=', data.CondicionIVAReceptorId, 'para', row.doc_tipo, row.doc_nro);
+  // Obligatorio cuando Concepto es 2 (Servicios) o 3 (Ambos)
+  if (data.Concepto === 2 || data.Concepto === 3) {
+    data.FchServDesde = cbteFch;
+    data.FchServHasta = cbteFch;
+    data.FchVtoPago   = cbteFch;
+  }
+
+  console.log(
+    'Usando CondicionIVAReceptorId=',
+    data.CondicionIVAReceptorId,
+    'Concepto=',
+    data.Concepto,
+    'Fechas Serv=',
+    data.FchServDesde,
+    data.FchServHasta,
+    data.FchVtoPago
+  );
 
   // Usa el siguiente número de comprobante disponible
   const res = await afip.ElectronicBilling.createNextVoucher(data);
