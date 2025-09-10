@@ -15,7 +15,7 @@ const SHEET_NAME = process.env.SHEET_NAME || 'Hoja 1';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-const AFIP_CUIT = Number(process.env.AFIP_CUIT || '20409378472'); // CUIT test default
+const AFIP_CUIT = Number(process.env.AFIP_CUIT || '20409378472'); // CUIT test por defecto
 const AFIP_PROD = String(process.env.AFIP_PROD || 'false') === 'true';
 const AFIP_PTO_VTA = Number(process.env.AFIP_PTO_VTA || '1');
 const AFIP_CBTE_TIPO = Number(process.env.AFIP_CBTE_TIPO || '11'); // 11 = Factura C
@@ -24,11 +24,10 @@ const AFIP_CBTE_TIPO = Number(process.env.AFIP_CBTE_TIPO || '11'); // 11 = Factu
 const AFIP_CERT = process.env.AFIP_CERT ? process.env.AFIP_CERT.replace(/\\n/g, '\n') : undefined;
 const AFIP_KEY  = process.env.AFIP_KEY  ? process.env.AFIP_KEY.replace(/\\n/g, '\n') : undefined;
 
-// ====== HELPERS ======
+// ====== HELPERS (errores legibles) ======
 function humanError(e) {
   try {
     if (!e) return 'Error desconocido';
-    // Mensajes útiles comunes (Axios/HTTP, SOAP, Google, Node, etc.)
     const data = e.response?.data;
     if (typeof data === 'string') return data.slice(0, 500);
     if (data?.faultstring) return data.faultstring;
@@ -41,7 +40,6 @@ function humanError(e) {
 }
 
 function logError(prefix, e) {
-  // Deja info clara en logs
   const msg = humanError(e);
   console.error(`[${prefix}]`, msg, e?.stack ? `\nSTACK:\n${e.stack}` : '');
   return msg;
@@ -163,6 +161,15 @@ async function appendRow(row) {
 
 function docTipoCode(t) { return String(t).toUpperCase() === 'CUIT' ? 80 : 96; } // 80=CUIT, 96=DNI
 
+// ====== NUEVO: Condición IVA del receptor ======
+// IDs comunes: 1=RI, 6=Monotributo, 4=Exento, 5=Consumidor Final, 7=No Categorizado, 15=No Alcanzado
+function getCondicionIVAReceptorId(parsed) {
+  if (parsed.doc_tipo === 'DNI') return 5; // Consumidor Final para DNI
+  // Para CUIT, usamos un default configurable por variable de entorno (6=Monotributo, 1=RI, etc.)
+  const def = Number(process.env.IVA_COND_RECEPTOR_ID_DEFAULT || '6');
+  return def;
+}
+
 async function emitirFactura(row) {
   const ahora = new Date();
   const yyyymmdd = `${ahora.getFullYear()}${String(ahora.getMonth()+1).padStart(2,'0')}${String(ahora.getDate()).padStart(2,'0')}`;
@@ -182,8 +189,12 @@ async function emitirFactura(row) {
     ImpTrib: 0,
     MonId: 'PES',
     MonCotiz: 1,
-    Iva: []
+    Iva: [],
+    // Campo requerido por RG 5616:
+    CondicionIVAReceptorId: getCondicionIVAReceptorId(row)
   };
+
+  console.log('Usando CondicionIVAReceptorId=', data.CondicionIVAReceptorId, 'para', row.doc_tipo, row.doc_nro);
 
   // Usa el siguiente número de comprobante disponible
   const res = await afip.ElectronicBilling.createNextVoucher(data);
@@ -211,7 +222,7 @@ async function updateLastRowWithResult(result) {
   }
 }
 
-// ====== HANDLER TELEGRAM (con mensaje de error detallado) ======
+// ====== HANDLER TELEGRAM (con errores detallados) ======
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
@@ -250,7 +261,6 @@ bot.on('message', async (msg) => {
     await updateLastRowWithResult(result);
   } catch (e) {
     const msg = logError('SHEETS_UPDATE', e);
-    // Igual avisamos que la factura salió
     await bot.sendMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}\n⚠️ Pero no pude escribir el resultado en tu planilla: ${msg}`);
     return;
   }
