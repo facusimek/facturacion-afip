@@ -15,7 +15,7 @@ const SHEET_NAME = process.env.SHEET_NAME || 'Hoja 1';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-const AFIP_CUIT = Number(process.env.AFIP_CUIT || '20409378472'); // CUIT test por defecto (homologación)
+const AFIP_CUIT = Number(process.env.AFIP_CUIT || '20409378472'); // CUIT test (homologación)
 const AFIP_PROD = String(process.env.AFIP_PROD || 'false') === 'true';
 const AFIP_PTO_VTA = Number(process.env.AFIP_PTO_VTA || '1');
 const AFIP_CBTE_TIPO = Number(process.env.AFIP_CBTE_TIPO || '11'); // 11 = Factura C
@@ -34,22 +34,17 @@ function humanError(e) {
     if (data?.error?.message) return data.error.message;
     if (e.message) return e.message;
     return JSON.stringify(e).slice(0, 500);
-  } catch (_) {
-    return 'Error desconocido';
-  }
+  } catch (_) { return 'Error desconocido'; }
 }
-
 function logError(prefix, e) {
   const msg = humanError(e);
   console.error(`[${prefix}]`, msg, e?.stack ? `\nSTACK:\n${e.stack}` : '');
   return msg;
 }
-
 function toYYYYMMDD(dateStr) {
-  // dateStr esperado: YYYY-MM-DD (columna 'fecha' de la planilla)
   const d = dateStr ? new Date(dateStr) : new Date();
-  const isValid = !isNaN(d.getTime());
-  const dd = isValid ? d : new Date();
+  const ok = !isNaN(d.getTime());
+  const dd = ok ? d : new Date();
   const y = dd.getFullYear();
   const m = String(dd.getMonth() + 1).padStart(2, '0');
   const day = String(dd.getDate()).padStart(2, '0');
@@ -75,7 +70,7 @@ const afip = new Afip({
 const bot = new TelegramBot(TELEGRAM_TOKEN, { webHook: true });
 bot.setWebHook(WEBHOOK_URL);
 
-// ====== EXPRESS (una sola instancia) ======
+// ====== EXPRESS ======
 const app = express();
 app.use(bodyParser.json());
 
@@ -85,7 +80,7 @@ app.post('/telegram', (req, res) => {
   res.sendStatus(200);
 });
 
-// Healthcheck simple (sí abre en el navegador)
+// Healthcheck
 app.get('/', (_, res) => res.send('OK'));
 
 // (Opcional) Endpoints de diagnóstico rápido
@@ -104,18 +99,14 @@ app.get('/diag/sheets', async (_, res) => {
     };
     await appendRow(dummy);
     res.send('SHEETS OK');
-  } catch (e) {
-    res.status(500).send('SHEETS ERROR: ' + humanError(e));
-  }
+  } catch (e) { res.status(500).send('SHEETS ERROR: ' + humanError(e)); }
 });
 
 app.get('/diag/afip', async (_, res) => {
   try {
     const st = await afip.ElectronicBilling.getServerStatus();
     res.send('AFIP OK: ' + JSON.stringify(st));
-  } catch (e) {
-    res.status(500).send('AFIP ERROR: ' + humanError(e));
-  }
+  } catch (e) { res.status(500).send('AFIP ERROR: ' + humanError(e)); }
 });
 
 // ====== LÓGICA ======
@@ -172,24 +163,23 @@ async function appendRow(row) {
 
 function docTipoCode(t) { return String(t).toUpperCase() === 'CUIT' ? 80 : 96; } // 80=CUIT, 96=DNI
 
-// ====== Condición IVA del receptor ======
-// IDs comunes: 1=RI, 6=Monotributo, 4=Exento, 5=Consumidor Final, 7=No Categorizado, 15=No Alcanzado
+// Condición IVA del receptor (RG 5616)
 function getCondicionIVAReceptorId(parsed) {
-  if (parsed.doc_tipo === 'DNI') return 5; // Consumidor Final para DNI
-  // Para CUIT, usamos un default configurable por variable de entorno (6=Monotributo, 1=RI, etc.)
-  const def = Number(process.env.IVA_COND_RECEPTOR_ID_DEFAULT || '6');
+  if (parsed.doc_tipo === 'DNI') return 5; // Consumidor Final
+  const def = Number(process.env.IVA_COND_RECEPTOR_ID_DEFAULT || '6'); // 6=Monotributo por defecto
   return def;
 }
 
 async function emitirFactura(row) {
-  // Fecha del comprobante y fechas de servicio (obligatorias para Concepto 2 o 3)
+  // Fechas (obligatorias para servicios)
   const cbteFch = toYYYYMMDD(row.fecha);
+  const isFacturaC = Number(row.cbte_tipo) === 11;
 
   const data = {
     CantReg: 1,
     PtoVta: Number(row.pto_vta),
     CbteTipo: Number(row.cbte_tipo),   // 11 = Factura C
-    Concepto: Number(row.concepto),    // 2 = Servicios (por defecto)
+    Concepto: Number(row.concepto),    // 2 = Servicios
     DocTipo: docTipoCode(row.doc_tipo),
     DocNro: Number(row.doc_nro),
     CbteFch: cbteFch,
@@ -200,29 +190,27 @@ async function emitirFactura(row) {
     ImpTrib: 0,
     MonId: 'PES',
     MonCotiz: 1,
-    Iva: [],
     CondicionIVAReceptorId: getCondicionIVAReceptorId(row)
+    // IMPORTANTE: NO incluir "Iva" cuando es Factura C (evita error 10071)
   };
 
-  // Obligatorio cuando Concepto es 2 (Servicios) o 3 (Ambos)
+  // Fechas obligatorias para Concepto 2 o 3
   if (data.Concepto === 2 || data.Concepto === 3) {
     data.FchServDesde = cbteFch;
     data.FchServHasta = cbteFch;
     data.FchVtoPago   = cbteFch;
   }
 
+  // Solo si NO fuera Factura C y tuvieras IVA (no es nuestro caso) agregarías "Iva".
+  // if (!isFacturaC && data.ImpIVA > 0) { data.Iva = [ ... ]; }
+
   console.log(
-    'Usando CondicionIVAReceptorId=',
-    data.CondicionIVAReceptorId,
-    'Concepto=',
-    data.Concepto,
-    'Fechas Serv=',
-    data.FchServDesde,
-    data.FchServHasta,
-    data.FchVtoPago
+    'CbteTipo=', data.CbteTipo,
+    '| CondIVARec=', data.CondicionIVAReceptorId,
+    '| Concepto=', data.Concepto,
+    '| FchServ=', data.FchServDesde, data.FchServHasta, data.FchVtoPago
   );
 
-  // Usa el siguiente número de comprobante disponible
   const res = await afip.ElectronicBilling.createNextVoucher(data);
   return { CAE: res.CAE, CAEFchVto: res.CAEFchVto, voucher_number: res.voucher_number };
 }
@@ -248,7 +236,7 @@ async function updateLastRowWithResult(result) {
   }
 }
 
-// ====== HANDLER TELEGRAM (con errores detallados) ======
+// ====== HANDLER TELEGRAM ======
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
@@ -265,7 +253,7 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, 'Formato incorrecto. Usá: Nombre | DNI o CUIT | Detalle | Total');
   }
 
-  // Paso 1: escribir en Sheets
+  // Paso 1: Google Sheets
   try {
     await appendRow(parsed);
   } catch (e) {
@@ -273,7 +261,7 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, '❌ Error en Google Sheets: ' + msg);
   }
 
-  // Paso 2: emitir en AFIP
+  // Paso 2: AFIP
   let result;
   try {
     result = await emitirFactura(parsed);
@@ -282,16 +270,16 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, '❌ Error en AFIP: ' + msg);
   }
 
-  // Paso 3: actualizar fila con CAE
+  // Paso 3: actualizar fila
   try {
     await updateLastRowWithResult(result);
   } catch (e) {
     const msg = logError('SHEETS_UPDATE', e);
-    await bot.sendMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}\n⚠️ Pero no pude escribir el resultado en tu planilla: ${msg}`);
+    await bot.sendMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}\n⚠️ No pude escribir el resultado en tu planilla: ${msg}`);
     return;
   }
 
-  // OK final
+  // OK
   return bot.sendMessage(
     chatId,
     `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}`
