@@ -1,0 +1,17 @@
+{
+  "name": "facturacion-afip",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@afipsdk/afip.js": "^6.5.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^132.0.0",
+    "node-telegram-bot-api": "^0.63.0",
+    "body-parser": "^1.20.2"
+  }
+}
