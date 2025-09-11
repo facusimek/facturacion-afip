@@ -8,7 +8,7 @@ const { google } = require('googleapis');
 const TelegramBot = require('node-telegram-bot-api');
 const Afip = require('@afipsdk/afip.js');
 
-// === PDF/QR y utilidades ===
+// PDF/QR y utilidades
 const fs = require('fs');
 const path = require('path');
 const PDFDocument = require('pdfkit');
@@ -32,6 +32,11 @@ const AFIP_KEY  = process.env.AFIP_KEY  ? process.env.AFIP_KEY.replace(/\\n/g, '
 
 // Drive opcional
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
+
+// Timeouts (ms)
+const TG_TIMEOUT_MS = 12000;
+const AFIP_TIMEOUT_MS = 20000;
+const DRIVE_TIMEOUT_MS = 15000;
 
 // ====== HELPERS ======
 function humanError(e) {
@@ -59,7 +64,6 @@ function toYYYYMMDD(dateStr) {
   const day = String(dd.getDate()).padStart(2, '0');
   return `${y}${m}${day}`;
 }
-// 👉 Timeout “duro” para promesas (evita cuelgues silenciosos)
 function withTimeout(promise, ms, label='OP') {
   return Promise.race([
     promise,
@@ -89,6 +93,14 @@ const afip = new Afip({
 // ====== TELEGRAM WEBHOOK ======
 const bot = new TelegramBot(TELEGRAM_TOKEN, { webHook: true });
 bot.setWebHook(WEBHOOK_URL);
+async function sendTgMessage(chatId, text, opts) {
+  try { return await withTimeout(bot.sendMessage(chatId, text, opts), TG_TIMEOUT_MS, 'Telegram sendMessage'); }
+  catch (e) { logError('TG_SEND_MSG', e); }
+}
+async function sendTgDocument(chatId, filePath, opts) {
+  try { return await withTimeout(bot.sendDocument(chatId, fs.createReadStream(filePath), opts), TG_TIMEOUT_MS, 'Telegram sendDocument'); }
+  catch (e) { logError('TG_SEND_DOC', e); }
+}
 
 // ====== EXPRESS ======
 const app = express();
@@ -266,7 +278,11 @@ async function subirPDFaDrive({ filePath, fileName }) {
   if (!DRIVE_FOLDER_ID) return null;
   const fileMeta = { name: fileName, parents: [DRIVE_FOLDER_ID] };
   const media = { mimeType: 'application/pdf', body: fs.createReadStream(filePath) };
-  const res = await drive.files.create({ requestBody: fileMeta, media, fields: 'id, webViewLink, webContentLink' });
+  const res = await withTimeout(
+    drive.files.create({ requestBody: fileMeta, media, fields: 'id, webViewLink, webContentLink' }),
+    DRIVE_TIMEOUT_MS,
+    'Drive upload'
+  );
   return res.data;
 }
 
@@ -299,10 +315,9 @@ async function emitirFactura(row) {
   }
 
   console.log('AFIP createNextVoucher START');
-  // 👉 Timeout de 20s para evitar cuelgue silencioso
   const res = await withTimeout(
     afip.ElectronicBilling.createNextVoucher(data),
-    20000,
+    AFIP_TIMEOUT_MS,
     'AFIP createNextVoucher'
   );
   console.log('AFIP createNextVoucher DONE');
@@ -336,67 +351,84 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
 
-  if (text === '/start') {
-    return bot.sendMessage(chatId, 'Hola! Enviame: Nombre | DNI o CUIT | Detalle | Total\nEjemplo:\nJuan Perez | DNI 12345678 | Servicio de diseño | 5000');
-  }
-
-  const parsed = parseMessage(text);
-  if (!parsed) {
-    return bot.sendMessage(chatId, 'Formato incorrecto. Usá: Nombre | DNI o CUIT | Detalle | Total');
-  }
-
-  // 1) Google Sheets
+  // Catch general del handler para no “silenciar” errores inesperados
   try {
-    await appendRow(parsed);
-  } catch (e) {
-    const msgErr = logError('SHEETS_APPEND', e);
-    return bot.sendMessage(chatId, '❌ Error en Google Sheets: ' + msgErr);
-  }
-
-  // 2) AFIP (con timeout)
-  let result;
-  try {
-    result = await emitirFactura(parsed);
-  } catch (e) {
-    const msgErr = logError('AFIP_EMITIR', e);
-    return bot.sendMessage(chatId, '❌ Error en AFIP: ' + msgErr);
-  }
-
-  // 3) PDF y envío
-  let pdfInfo;
-  try {
-    pdfInfo = await generarPDF({ row: parsed, result });
-    await bot.sendDocument(chatId, fs.createReadStream(pdfInfo.filePath), {
-      caption: `Factura C ${String(parsed.pto_vta).padStart(4,'0')}-${String(result.voucher_number).padStart(8,'0')} | CAE ${result.CAE}`
-    });
-  } catch (e) {
-    console.error('[PDF]', humanError(e));
-  }
-
-  // 4) Drive (opcional)
-  try {
-    const driveFile = await subirPDFaDrive(pdfInfo || {});
-    if (driveFile?.webViewLink) {
-      await bot.sendMessage(chatId, `📄 Guardé una copia en Drive: ${driveFile.webViewLink}`);
+    if (text === '/start') {
+      await sendTgMessage(chatId, 'Hola! Enviame: Nombre | DNI o CUIT | Detalle | Total\nEjemplo:\nJuan Perez | DNI 12345678 | Servicio de diseño | 5000');
+      return;
     }
-  } catch (e) {
-    console.error('[DRIVE]', humanError(e));
-  }
 
-  // 5) Actualizar planilla
-  try {
-    await updateLastRowWithResult(result);
-  } catch (e) {
-    const msgErr = logError('SHEETS_UPDATE', e);
-    await bot.sendMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}\n⚠️ No pude escribir el resultado en tu planilla: ${msgErr}`);
-    return;
-  }
+    const parsed = parseMessage(text);
+    if (!parsed) {
+      await sendTgMessage(chatId, 'Formato incorrecto. Usá: Nombre | DNI o CUIT | Detalle | Total');
+      return;
+    }
 
-  // 6) Mensaje final OK
-  return bot.sendMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}`);
+    // 1) Google Sheets
+    try { await appendRow(parsed); }
+    catch (e) {
+      const msgErr = logError('SHEETS_APPEND', e);
+      await sendTgMessage(chatId, '❌ Error en Google Sheets: ' + msgErr);
+      return;
+    }
+
+    // ACK inmediato para que el usuario vea algo
+    await sendTgMessage(chatId, '⏳ Recibí los datos. Estoy emitiendo la factura...');
+
+    // 2) AFIP (con timeout)
+    let result;
+    try { result = await emitirFactura(parsed); }
+    catch (e) {
+      const msgErr = logError('AFIP_EMITIR', e);
+      await sendTgMessage(chatId, '❌ Error en AFIP: ' + msgErr);
+      return;
+    }
+
+    // 3) PDF y envío
+    let pdfInfo;
+    try {
+      pdfInfo = await generarPDF({ row: parsed, result });
+      await sendTgDocument(
+        chatId,
+        pdfInfo.filePath,
+        { caption: `Factura C ${String(parsed.pto_vta).padStart(4,'0')}-${String(result.voucher_number).padStart(8,'0')} | CAE ${result.CAE}` }
+      );
+    } catch (e) {
+      logError('PDF', e);
+    }
+
+    // 4) Drive (opcional)
+    try {
+      const driveFile = await subirPDFaDrive(pdfInfo || {});
+      if (driveFile?.webViewLink) {
+        await sendTgMessage(chatId, `📄 Guardé una copia en Drive: ${driveFile.webViewLink}`);
+      }
+    } catch (e) {
+      logError('DRIVE', e);
+    }
+
+    // 5) Actualizar planilla
+    try { await updateLastRowWithResult(result); }
+    catch (e) {
+      const msgErr = logError('SHEETS_UPDATE', e);
+      await sendTgMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}\n⚠️ No pude escribir el resultado en tu planilla: ${msgErr}`);
+      return;
+    }
+
+    // 6) Mensaje final OK
+    await sendTgMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}`);
+  } catch (e) {
+    const msgErr = logError('HANDLER_FATAL', e);
+    // intentamos avisar igual
+    await sendTgMessage(chatId, '❌ Error inesperado: ' + msgErr);
+  }
 });
 
 // ====== START ======
 app.listen(PORT, () => {
   console.log('Server on', PORT, '| PROD=', AFIP_PROD, '| PtoVta=', AFIP_PTO_VTA, '| Tipo=', AFIP_CBTE_TIPO);
 });
+
+// Para no matar el proceso por errores no capturados
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
