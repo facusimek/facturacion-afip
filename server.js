@@ -8,7 +8,7 @@ const { google } = require('googleapis');
 const TelegramBot = require('node-telegram-bot-api');
 const Afip = require('@afipsdk/afip.js');
 
-// === NUEVO: librerías para PDF/QR y utilidades de archivos ===
+// === PDF/QR y utilidades ===
 const fs = require('fs');
 const path = require('path');
 const PDFDocument = require('pdfkit');
@@ -21,19 +21,19 @@ const SHEET_NAME = process.env.SHEET_NAME || 'Hoja 1';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-const AFIP_CUIT = Number(process.env.AFIP_CUIT || '20409378472'); // CUIT test (homologación)
+const AFIP_CUIT = Number(process.env.AFIP_CUIT || '20409378472'); // homologación
 const AFIP_PROD = String(process.env.AFIP_PROD || 'false') === 'true';
 const AFIP_PTO_VTA = Number(process.env.AFIP_PTO_VTA || '1');
 const AFIP_CBTE_TIPO = Number(process.env.AFIP_CBTE_TIPO || '11'); // 11 = Factura C
 
-// Para producción real (si AFIP_PROD=true)
+// Producción (si AFIP_PROD=true)
 const AFIP_CERT = process.env.AFIP_CERT ? process.env.AFIP_CERT.replace(/\\n/g, '\n') : undefined;
 const AFIP_KEY  = process.env.AFIP_KEY  ? process.env.AFIP_KEY.replace(/\\n/g, '\n') : undefined;
 
-// === NUEVO: carpeta de Google Drive (opcional)
+// Drive opcional
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
 
-// ====== HELPERS (errores legibles) ======
+// ====== HELPERS ======
 function humanError(e) {
   try {
     if (!e) return 'Error desconocido';
@@ -59,18 +59,23 @@ function toYYYYMMDD(dateStr) {
   const day = String(dd.getDate()).padStart(2, '0');
   return `${y}${m}${day}`;
 }
+// 👉 Timeout “duro” para promesas (evita cuelgues silenciosos)
+function withTimeout(promise, ms, label='OP') {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timeout a ${ms}ms`)), ms))
+  ]);
+}
 
 // ====== GOOGLE CLIENTS ======
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SA_JSON),
   scopes: [
     'https://www.googleapis.com/auth/spreadsheets',
-    // === NUEVO: permisos de Drive, necesarios si subís PDFs
-    'https://www.googleapis.com/auth/drive.file'
+    'https://www.googleapis.com/auth/drive.file' // para subir PDFs si querés
   ]
 });
 const sheets = google.sheets({ version: 'v4', auth });
-// === NUEVO: cliente de Google Drive
 const drive = google.drive({ version: 'v3', auth });
 
 // ====== AFIP SDK ======
@@ -89,7 +94,7 @@ bot.setWebHook(WEBHOOK_URL);
 const app = express();
 app.use(bodyParser.json());
 
-// Endpoint que Telegram llama (no abre en el navegador)
+// Telegram webhook endpoint
 app.post('/telegram', (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
@@ -98,7 +103,7 @@ app.post('/telegram', (req, res) => {
 // Healthcheck
 app.get('/', (_, res) => res.send('OK'));
 
-// (Opcional) Endpoints de diagnóstico rápido
+// Diagnóstico opcional
 app.get('/diag/sheets', async (_, res) => {
   try {
     const dummy = {
@@ -106,7 +111,7 @@ app.get('/diag/sheets', async (_, res) => {
       cliente_nombre: 'TEST',
       doc_tipo: 'DNI',
       doc_nro: '12345678',
-      concepto: 2, // Servicios
+      concepto: 2,
       detalle: 'ping',
       total: 1,
       pto_vta: AFIP_PTO_VTA,
@@ -116,10 +121,9 @@ app.get('/diag/sheets', async (_, res) => {
     res.send('SHEETS OK');
   } catch (e) { res.status(500).send('SHEETS ERROR: ' + humanError(e)); }
 });
-
 app.get('/diag/afip', async (_, res) => {
   try {
-    const st = await afip.ElectronicBilling.getServerStatus();
+    const st = await withTimeout(afip.ElectronicBilling.getServerStatus(), 8000, 'AFIP status');
     res.send('AFIP OK: ' + JSON.stringify(st));
   } catch (e) { res.status(500).send('AFIP ERROR: ' + humanError(e)); }
 });
@@ -137,7 +141,6 @@ function parseMessage(text) {
     doc_tipo = m1[1].toUpperCase();
     doc_nro = m1[2];
   } else {
-    // si no puso prefijo, asumimos DNI
     doc_nro = docCampo.replace(/\D/g, '');
   }
 
@@ -147,7 +150,7 @@ function parseMessage(text) {
     cliente_nombre: nombre,
     doc_tipo,
     doc_nro,
-    concepto: 2, // *** Solo servicios por defecto ***
+    concepto: 2, // solo servicios
     detalle,
     total,
     pto_vta: AFIP_PTO_VTA,
@@ -175,72 +178,65 @@ async function appendRow(row) {
     requestBody: { values }
   });
 }
-
 function docTipoCode(t) { return String(t).toUpperCase() === 'CUIT' ? 80 : 96; } // 80=CUIT, 96=DNI
 
 // Condición IVA del receptor (RG 5616)
 function getCondicionIVAReceptorId(parsed) {
   if (parsed.doc_tipo === 'DNI') return 5; // Consumidor Final
-  const def = Number(process.env.IVA_COND_RECEPTOR_ID_DEFAULT || '6'); // 6=Monotributo por defecto
+  const def = Number(process.env.IVA_COND_RECEPTOR_ID_DEFAULT || '6'); // 6=Monotributo
   return def;
 }
 
-// === NUEVO: URL del QR AFIP según RG 4892
+// QR AFIP (RG 4892)
 function afipQrUrl({ fechaISO, ptoVta, tipoCmp, nroCmp, importe, tipoDocRec, nroDocRec, cae }) {
   const payload = {
     ver: 1,
-    fecha: fechaISO,               // "YYYY-MM-DD"
-    cuit: AFIP_CUIT,               // CUIT emisor
+    fecha: fechaISO,
+    cuit: AFIP_CUIT,
     ptoVta: Number(ptoVta),
     tipoCmp: Number(tipoCmp),
     nroCmp: Number(nroCmp),
     importe: Number(importe),
     moneda: 'PES',
     ctz: 1,
-    tipoDocRec: Number(tipoDocRec || 99), // 96 DNI / 80 CUIT / 99 - No Informado
+    tipoDocRec: Number(tipoDocRec || 99),
     nroDocRec: Number(nroDocRec || 0),
-    tipoCodAut: 'E',               // electrónico
+    tipoCodAut: 'E',
     codAut: Number(cae)
   };
   const base64url = Buffer.from(JSON.stringify(payload))
-    .toString('base64')
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    .toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   return 'https://www.afip.gob.ar/fe/qr/?p=' + base64url;
 }
 
-// === NUEVO: Generación de PDF con QR y datos básicos
+// PDF con QR
 async function generarPDF({ row, result }) {
   const fileName = `Factura_C_${String(row.pto_vta).padStart(4,'0')}-${String(result.voucher_number).padStart(8,'0')}.pdf`;
-  const filePath = path.join('/tmp', fileName); // Render permite escribir en /tmp
+  const filePath = path.join('/tmp', fileName);
 
   const doc = new PDFDocument({ size: 'A4', margin: 36 });
   doc.pipe(fs.createWriteStream(filePath));
 
-  // Encabezado
   doc.fontSize(18).text('FACTURA C', { align: 'center' });
   doc.moveDown(0.5);
   doc.fontSize(10).text(`Punto de Venta: ${row.pto_vta}  -  Número: ${result.voucher_number}`, { align: 'center' });
   doc.text(`Fecha: ${row.fecha}`, { align: 'center' });
   doc.moveDown();
 
-  // Emisor / Receptor
   doc.fontSize(11).text(`Emisor CUIT: ${AFIP_CUIT}`);
   doc.text(`Receptor: ${row.cliente_nombre}`);
   doc.text(`Doc: ${row.doc_tipo} ${row.doc_nro || '-'}`);
   doc.moveDown();
 
-  // Detalle y total
   doc.text(`Detalle: ${row.detalle}`);
   doc.moveDown(0.5);
   doc.fontSize(14).text(`TOTAL: $ ${Number(row.total).toFixed(2)}`, { align: 'right' });
   doc.moveDown();
 
-  // CAE
   doc.fontSize(11).text(`CAE: ${result.CAE}`);
   doc.text(`Vencimiento CAE: ${result.CAEFchVto}`);
   doc.moveDown();
 
-  // QR AFIP
   const qrUrl = afipQrUrl({
     fechaISO: row.fecha,
     ptoVta: row.pto_vta,
@@ -261,27 +257,20 @@ async function generarPDF({ row, result }) {
   doc.fontSize(8).fillColor('#555').text(qrUrl);
 
   doc.end();
-  await new Promise((res) => doc.on('finish', res));
+  await new Promise(res => doc.on('finish', res));
   return { filePath, fileName };
 }
 
-// === NUEVO: Subir PDF a Google Drive (opcional)
+// Subir PDF a Drive (opcional)
 async function subirPDFaDrive({ filePath, fileName }) {
   if (!DRIVE_FOLDER_ID) return null;
   const fileMeta = { name: fileName, parents: [DRIVE_FOLDER_ID] };
   const media = { mimeType: 'application/pdf', body: fs.createReadStream(filePath) };
-  const res = await drive.files.create({
-    requestBody: fileMeta,
-    media,
-    fields: 'id, webViewLink, webContentLink'
-  });
-  return res.data; // { id, webViewLink, webContentLink }
+  const res = await drive.files.create({ requestBody: fileMeta, media, fields: 'id, webViewLink, webContentLink' });
+  return res.data;
 }
 
-function docTipoCode(t) { return String(t).toUpperCase() === 'CUIT' ? 80 : 96; } // 80=CUIT, 96=DNI
-
 async function emitirFactura(row) {
-  // Fechas (obligatorias para servicios)
   const cbteFch = toYYYYMMDD(row.fecha);
 
   const data = {
@@ -299,25 +288,25 @@ async function emitirFactura(row) {
     ImpTrib: 0,
     MonId: 'PES',
     MonCotiz: 1,
-    // NO incluir "Iva" para Factura C (evita error 10071)
     CondicionIVAReceptorId: getCondicionIVAReceptorId(row)
+    // NO enviar "Iva" en Factura C
   };
 
-  // Fechas obligatorias para Concepto 2 o 3
   if (data.Concepto === 2 || data.Concepto === 3) {
     data.FchServDesde = cbteFch;
     data.FchServHasta = cbteFch;
     data.FchVtoPago   = cbteFch;
   }
 
-  console.log(
-    'CbteTipo=', data.CbteTipo,
-    '| CondIVARec=', data.CondicionIVAReceptorId,
-    '| Concepto=', data.Concepto,
-    '| FchServ=', data.FchServDesde, data.FchServHasta, data.FchVtoPago
+  console.log('AFIP createNextVoucher START');
+  // 👉 Timeout de 20s para evitar cuelgue silencioso
+  const res = await withTimeout(
+    afip.ElectronicBilling.createNextVoucher(data),
+    20000,
+    'AFIP createNextVoucher'
   );
+  console.log('AFIP createNextVoucher DONE');
 
-  const res = await afip.ElectronicBilling.createNextVoucher(data);
   return { CAE: res.CAE, CAEFchVto: res.CAEFchVto, voucher_number: res.voucher_number };
 }
 
@@ -328,8 +317,8 @@ async function updateLastRowWithResult(result) {
   });
   const rows = get.data.values || [];
   for (let i = rows.length - 1; i >= 1; i--) {
-    if (rows[i][9] === 'PENDIENTE') { // col J = estado
-      const rowIndex = i + 1; // 1-based
+    if (rows[i][9] === 'PENDIENTE') {
+      const rowIndex = i + 1;
       const updates = [[ 'EMITIDO', result.CAE, result.CAEFchVto, result.voucher_number, '' ]];
       await sheets.spreadsheets.values.update({
         spreadsheetId: SHEET_ID,
@@ -342,16 +331,13 @@ async function updateLastRowWithResult(result) {
   }
 }
 
-// ====== HANDLER TELEGRAM ======
+// ====== TELEGRAM HANDLER ======
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
 
   if (text === '/start') {
-    return bot.sendMessage(
-      chatId,
-      'Hola! Enviame: Nombre | DNI o CUIT | Detalle | Total\nEjemplo:\nJuan Perez | DNI 12345678 | Servicio de diseño | 5000'
-    );
+    return bot.sendMessage(chatId, 'Hola! Enviame: Nombre | DNI o CUIT | Detalle | Total\nEjemplo:\nJuan Perez | DNI 12345678 | Servicio de diseño | 5000');
   }
 
   const parsed = parseMessage(text);
@@ -359,7 +345,7 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, 'Formato incorrecto. Usá: Nombre | DNI o CUIT | Detalle | Total');
   }
 
-  // Paso 1: Google Sheets
+  // 1) Google Sheets
   try {
     await appendRow(parsed);
   } catch (e) {
@@ -367,7 +353,7 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, '❌ Error en Google Sheets: ' + msgErr);
   }
 
-  // Paso 2: AFIP
+  // 2) AFIP (con timeout)
   let result;
   try {
     result = await emitirFactura(parsed);
@@ -376,7 +362,7 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, '❌ Error en AFIP: ' + msgErr);
   }
 
-  // === NUEVO: generar PDF y enviarlo por Telegram
+  // 3) PDF y envío
   let pdfInfo;
   try {
     pdfInfo = await generarPDF({ row: parsed, result });
@@ -387,7 +373,7 @@ bot.on('message', async (msg) => {
     console.error('[PDF]', humanError(e));
   }
 
-  // === NUEVO: subir a Google Drive (si DRIVE_FOLDER_ID está configurado)
+  // 4) Drive (opcional)
   try {
     const driveFile = await subirPDFaDrive(pdfInfo || {});
     if (driveFile?.webViewLink) {
@@ -397,7 +383,7 @@ bot.on('message', async (msg) => {
     console.error('[DRIVE]', humanError(e));
   }
 
-  // Paso 3: actualizar fila (CAE)
+  // 5) Actualizar planilla
   try {
     await updateLastRowWithResult(result);
   } catch (e) {
@@ -406,11 +392,8 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // OK final
-  return bot.sendMessage(
-    chatId,
-    `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}`
-  );
+  // 6) Mensaje final OK
+  return bot.sendMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}`);
 });
 
 // ====== START ======
