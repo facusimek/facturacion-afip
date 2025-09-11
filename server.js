@@ -93,6 +93,8 @@ const afip = new Afip({
 // ====== TELEGRAM WEBHOOK ======
 const bot = new TelegramBot(TELEGRAM_TOKEN, { webHook: true });
 bot.setWebHook(WEBHOOK_URL);
+
+// Helpers Telegram con timeout
 async function sendTgMessage(chatId, text, opts) {
   try { return await withTimeout(bot.sendMessage(chatId, text, opts), TG_TIMEOUT_MS, 'Telegram sendMessage'); }
   catch (e) { logError('TG_SEND_MSG', e); }
@@ -351,16 +353,25 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
 
-  // Catch general del handler para no “silenciar” errores inesperados
+  // Watchdog: si en 35s no se resolvió, avisamos
+  let finished = false;
+  const watchdog = setTimeout(async () => {
+    if (!finished) {
+      await sendTgMessage(chatId, '⚠️ Se está demorando más de lo normal. Podés reintentar en unos minutos. Si vuelve a pasar, mirá Logs en Render.');
+    }
+  }, 35000);
+
   try {
     if (text === '/start') {
       await sendTgMessage(chatId, 'Hola! Enviame: Nombre | DNI o CUIT | Detalle | Total\nEjemplo:\nJuan Perez | DNI 12345678 | Servicio de diseño | 5000');
+      finished = true; clearTimeout(watchdog);
       return;
     }
 
     const parsed = parseMessage(text);
     if (!parsed) {
       await sendTgMessage(chatId, 'Formato incorrecto. Usá: Nombre | DNI o CUIT | Detalle | Total');
+      finished = true; clearTimeout(watchdog);
       return;
     }
 
@@ -369,11 +380,13 @@ bot.on('message', async (msg) => {
     catch (e) {
       const msgErr = logError('SHEETS_APPEND', e);
       await sendTgMessage(chatId, '❌ Error en Google Sheets: ' + msgErr);
+      finished = true; clearTimeout(watchdog);
       return;
     }
 
-    // ACK inmediato para que el usuario vea algo
-    await sendTgMessage(chatId, '⏳ Recibí los datos. Estoy emitiendo la factura...');
+    // Avances a Telegram
+    await sendTgMessage(chatId, '⏳ Recibí los datos. Estoy emitiendo la factura…');
+    await sendTgMessage(chatId, '➡️ Enviando solicitud a AFIP…');
 
     // 2) AFIP (con timeout)
     let result;
@@ -381,8 +394,11 @@ bot.on('message', async (msg) => {
     catch (e) {
       const msgErr = logError('AFIP_EMITIR', e);
       await sendTgMessage(chatId, '❌ Error en AFIP: ' + msgErr);
+      finished = true; clearTimeout(watchdog);
       return;
     }
+
+    await sendTgMessage(chatId, '🧾 AFIP respondió. Generando PDF…');
 
     // 3) PDF y envío
     let pdfInfo;
@@ -395,16 +411,21 @@ bot.on('message', async (msg) => {
       );
     } catch (e) {
       logError('PDF', e);
+      await sendTgMessage(chatId, '⚠️ La factura salió pero no pude adjuntar el PDF.');
     }
 
     // 4) Drive (opcional)
-    try {
-      const driveFile = await subirPDFaDrive(pdfInfo || {});
-      if (driveFile?.webViewLink) {
-        await sendTgMessage(chatId, `📄 Guardé una copia en Drive: ${driveFile.webViewLink}`);
+    if (DRIVE_FOLDER_ID) {
+      await sendTgMessage(chatId, '☁️ Subiendo copia a Drive…');
+      try {
+        const driveFile = await withTimeout(subirPDFaDrive(pdfInfo || {}), DRIVE_TIMEOUT_MS, 'Drive upload wrapper');
+        if (driveFile?.webViewLink) {
+          await sendTgMessage(chatId, `📄 Guardé una copia en Drive: ${driveFile.webViewLink}`);
+        }
+      } catch (e) {
+        logError('DRIVE', e);
+        await sendTgMessage(chatId, '⚠️ No pude subir a Drive, pero la factura fue emitida.');
       }
-    } catch (e) {
-      logError('DRIVE', e);
     }
 
     // 5) Actualizar planilla
@@ -412,15 +433,17 @@ bot.on('message', async (msg) => {
     catch (e) {
       const msgErr = logError('SHEETS_UPDATE', e);
       await sendTgMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}\n⚠️ No pude escribir el resultado en tu planilla: ${msgErr}`);
+      finished = true; clearTimeout(watchdog);
       return;
     }
 
     // 6) Mensaje final OK
     await sendTgMessage(chatId, `✅ Factura emitida\nCAE: ${result.CAE}\nVence: ${result.CAEFchVto}\nNro: ${result.voucher_number}`);
+    finished = true; clearTimeout(watchdog);
   } catch (e) {
     const msgErr = logError('HANDLER_FATAL', e);
-    // intentamos avisar igual
     await sendTgMessage(chatId, '❌ Error inesperado: ' + msgErr);
+    finished = true; clearTimeout(watchdog);
   }
 });
 
@@ -428,7 +451,5 @@ bot.on('message', async (msg) => {
 app.listen(PORT, () => {
   console.log('Server on', PORT, '| PROD=', AFIP_PROD, '| PtoVta=', AFIP_PTO_VTA, '| Tipo=', AFIP_CBTE_TIPO);
 });
-
-// Para no matar el proceso por errores no capturados
 process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
