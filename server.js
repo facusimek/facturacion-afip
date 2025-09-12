@@ -110,11 +110,25 @@ const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SA_JSON),
   scopes: [
     'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive.file' // para subir PDFs si querés
+    'https://www.googleapis.com/auth/drive.file' // subir PDFs si querés
   ]
 });
 const sheets = google.sheets({ version: 'v4', auth });
 const drive = google.drive({ version: 'v3', auth });
+
+// === DRIVE con OAuth del usuario (usa tu cuota) ===
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_OAUTH_CLIENT_ID,
+  process.env.GOOGLE_OAUTH_CLIENT_SECRET
+);
+if (process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+  oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN });
+}
+const driveUser = process.env.GOOGLE_OAUTH_REFRESH_TOKEN
+  ? google.drive({ version: 'v3', auth: oauth2Client })
+  : null;
+const DRIVE_MODE = driveUser ? 'OAUTH_USER' : 'SERVICE_ACCOUNT';
+console.log('[DRIVE] Mode:', DRIVE_MODE);
 
 // ====== AFIP SDK ======
 const afip = new Afip({
@@ -178,16 +192,33 @@ app.get('/diag/afip', async (_, res) => {
 app.get('/diag/drive', async (_, res) => {
   try {
     if (!DRIVE_FOLDER_ID) return res.status(400).send('Falta DRIVE_FOLDER_ID');
+    const drv = driveUser || drive;
     const tmp = '/tmp/drive-test.txt';
     fs.writeFileSync(tmp, 'hello drive');
-    const up = await drive.files.create({
+    const up = await drv.files.create({
       requestBody: { name: 'drive-test.txt', parents: [DRIVE_FOLDER_ID] },
       media: { mimeType: 'text/plain', body: fs.createReadStream(tmp) },
       fields: 'id, webViewLink, parents',
       supportsAllDrives: true
     });
     res.send('DRIVE OK: ' + JSON.stringify(up.data));
-  } catch (e) { res.status(500).send('DRIVE ERROR: ' + humanError(e)); }
+  } catch (e) {
+    res.status(500).send('DRIVE ERROR: ' + humanError(e));
+  }
+});
+app.get('/diag/whoami', async (_, res) => {
+  try {
+    if (driveUser) {
+      const about = await driveUser.about.get({ fields: 'user(emailAddress,displayName)' });
+      return res.send(`Drive auth: OAUTH como ${about.data.user?.emailAddress}`);
+    }
+    const saEmail = (() => {
+      try { return JSON.parse(process.env.GOOGLE_SA_JSON)?.client_email; } catch { return ''; }
+    })();
+    return res.send(`Drive auth: SERVICE_ACCOUNT ${saEmail}`);
+  } catch (e) {
+    return res.status(500).send('whoami error: ' + humanError(e));
+  }
 });
 
 // ====== LÓGICA ======
@@ -419,14 +450,16 @@ async function generarPDF({ row, result }) {
   return { filePath, fileName };
 }
 
-// Subir PDF a Google Drive (con supportsAllDrives y mejor diagnóstico)
+// Subir PDF a Google Drive (usa OAuth si está disponible)
 async function subirPDFaDrive({ filePath, fileName }) {
   if (!DRIVE_FOLDER_ID) return null;
+  const drv = driveUser || drive; // <— usa OAuth del usuario si existe
+
   const fileMeta = { name: fileName, parents: [DRIVE_FOLDER_ID] };
   const media = { mimeType: 'application/pdf', body: fs.createReadStream(filePath) };
   try {
     const res = await withTimeout(
-      drive.files.create({
+      drv.files.create({
         requestBody: fileMeta,
         media,
         fields: 'id, webViewLink, webContentLink, parents',
