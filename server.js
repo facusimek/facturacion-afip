@@ -33,6 +33,13 @@ const AFIP_KEY  = process.env.AFIP_KEY  ? process.env.AFIP_KEY.replace(/\\n/g, '
 // Drive opcional
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
 
+// Datos de emisor para el PDF (opcionales)
+const EM_NOMBRE  = process.env.EMISOR_NOMBRE  || `CUIT ${AFIP_CUIT}`;
+const EM_DOM     = process.env.EMISOR_DOMICILIO || '';
+const EM_RESPIVA = process.env.EMISOR_RESP_IVA || 'Monotributista';
+const EM_IIBB    = process.env.EMISOR_IIBB || '';
+const EM_INI     = process.env.EMISOR_INICIO_ACT || '';
+
 // Timeouts (ms)
 const TG_TIMEOUT_MS = 12000;
 const AFIP_TIMEOUT_MS = 20000;
@@ -144,7 +151,7 @@ app.post('/telegram', (req, res) => {
 // Healthcheck
 app.get('/', (_, res) => res.send('OK'));
 
-// Diagnóstico opcional
+// Diagnósticos
 app.get('/diag/sheets', async (_, res) => {
   try {
     const dummy = {
@@ -167,6 +174,20 @@ app.get('/diag/afip', async (_, res) => {
     const st = await withTimeout(afip.ElectronicBilling.getServerStatus(), 8000, 'AFIP status');
     res.send('AFIP OK: ' + JSON.stringify(st));
   } catch (e) { res.status(500).send('AFIP ERROR: ' + humanError(e)); }
+});
+app.get('/diag/drive', async (_, res) => {
+  try {
+    if (!DRIVE_FOLDER_ID) return res.status(400).send('Falta DRIVE_FOLDER_ID');
+    const tmp = '/tmp/drive-test.txt';
+    fs.writeFileSync(tmp, 'hello drive');
+    const up = await drive.files.create({
+      requestBody: { name: 'drive-test.txt', parents: [DRIVE_FOLDER_ID] },
+      media: { mimeType: 'text/plain', body: fs.createReadStream(tmp) },
+      fields: 'id, webViewLink, parents',
+      supportsAllDrives: true
+    });
+    res.send('DRIVE OK: ' + JSON.stringify(up.data));
+  } catch (e) { res.status(500).send('DRIVE ERROR: ' + humanError(e)); }
 });
 
 // ====== LÓGICA ======
@@ -275,7 +296,14 @@ function afipQrUrl({ fechaISO, ptoVta, tipoCmp, nroCmp, importe, tipoDocRec, nro
   return 'https://www.afip.gob.ar/fe/qr/?p=' + base64url;
 }
 
-// ====== FIX: PDF con QR (escuchar 'finish' en el stream) ======
+function formatARS(n) {
+  const v = Number(n || 0);
+  return '$ ' + v.toFixed(2)
+    .replace('.', ',')
+    .replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+// ====== PDF legible + FIX de finalización ======
 async function generarPDF({ row, result }) {
   const fileName = `Factura_C_${String(row.pto_vta).padStart(4,'0')}-${String(result.voucher_number).padStart(8,'0')}.pdf`;
   const filePath = path.join('/tmp', fileName);
@@ -284,26 +312,83 @@ async function generarPDF({ row, result }) {
   const out = fs.createWriteStream(filePath);
   doc.pipe(out);
 
-  doc.fontSize(18).text('FACTURA C', { align: 'center' });
+  const usableW = doc.page.width - 72;      // ancho útil (margen 36)
+  const startY = 36;
+
+  // Header: letra C
+  doc.rect(36, startY, 40, 40).stroke();
+  doc.fontSize(24).text('C', 36, startY + 7, { width: 40, align: 'center' });
+
+  // Datos emisor
+  const emX = 36 + 50;
+  doc.fontSize(12).text(EM_NOMBRE, emX, startY);
+  doc.fontSize(9).fillColor('#333');
+  if (EM_DOM)       doc.text(EM_DOM, emX, doc.y);
+  doc.text(`CUIT: ${AFIP_CUIT}   |   Resp. IVA: ${EM_RESPIVA}`, emX, doc.y);
+  if (EM_IIBB)      doc.text(`Ing. Brutos: ${EM_IIBB}`, emX, doc.y);
+  if (EM_INI)       doc.text(`Inicio de actividades: ${EM_INI}`, emX, doc.y);
+  doc.fillColor('black');
+
+  // Datos comprobante (derecha)
+  const compBoxW = 200, compX = 36 + usableW - compBoxW;
+  const compY = startY;
+  doc.rect(compX, compY, compBoxW, 40).stroke();
+  doc.fontSize(10).text(`Factura C`, compX + 8, compY + 6);
+  doc.text(`Pto Vta: ${String(row.pto_vta).padStart(4, '0')}   N°: ${String(result.voucher_number).padStart(8, '0')}`, compX + 8, doc.y);
+  doc.text(`Fecha: ${row.fecha}`, compX + 8, doc.y);
+
   doc.moveDown(0.5);
-  doc.fontSize(10).text(`Punto de Venta: ${row.pto_vta}  -  Número: ${result.voucher_number}`, { align: 'center' });
-  doc.text(`Fecha: ${row.fecha}`, { align: 'center' });
-  doc.moveDown();
+  // Receptor box
+  const recY = compY + 50;
+  doc.rect(36, recY, usableW, 60).stroke();
+  doc.fontSize(10).text(`Receptor: ${row.cliente_nombre}`, 42, recY + 6);
+  doc.text(`Documento: ${(row.doc_tipo || '-').toUpperCase()} ${row.doc_nro || '-'}`, 42, doc.y);
+  doc.text(`Cond. IVA: ${(row.doc_tipo || '').toUpperCase() === 'CUIT' ? (process.env.IVA_COND_RECEPTOR_ID_DEFAULT ? 'Resp. Inscripto/Monotributo' : 'CUIT') : 'Consumidor Final'}`, 42, doc.y);
 
-  doc.fontSize(11).text(`Emisor CUIT: ${AFIP_CUIT}`);
-  doc.text(`Receptor: ${row.cliente_nombre}`);
-  doc.text(`Doc: ${row.doc_tipo} ${row.doc_nro || '-'}`);
-  doc.moveDown();
+  // Ítems (simple: 1 renglón con el detalle)
+  const tableY = recY + 70;
+  const cols = [
+    { title: 'Descripción', x: 36, w: usableW - 200 },
+    { title: 'Cant.', x: 36 + (usableW - 200), w: 50, align: 'right' },
+    { title: 'P. Unit.', x: 36 + (usableW - 150), w: 75, align: 'right' },
+    { title: 'Importe', x: 36 + (usableW - 75), w: 75, align: 'right' }
+  ];
 
-  doc.text(`Detalle: ${row.detalle}`);
-  doc.moveDown(0.5);
-  doc.fontSize(14).text(`TOTAL: $ ${Number(row.total).toFixed(2)}`, { align: 'right' });
-  doc.moveDown();
+  // header tabla
+  doc.rect(36, tableY, usableW, 20).fillAndStroke('#f2f2f2', '#000');
+  doc.fillColor('#000').fontSize(9);
+  cols.forEach(c => doc.text(c.title, c.x + 6, tableY + 6, { width: c.w - 12, align: c.align || 'left' }));
 
-  doc.fontSize(11).text(`CAE: ${result.CAE}`);
-  doc.text(`Vencimiento CAE: ${result.CAEFchVto}`);
-  doc.moveDown();
+  // fila item
+  const itemY = tableY + 20;
+  doc.rect(36, itemY, usableW, 22).stroke();
+  const cant = 1;
+  const unit = Number(row.total);
+  const imp = unit * cant;
+  doc.text(row.detalle || 'Servicio', cols[0].x + 6, itemY + 6, { width: cols[0].w - 12 });
+  doc.text(String(cant), cols[1].x + 6, itemY + 6, { width: cols[1].w - 12, align: 'right' });
+  doc.text(formatARS(unit), cols[2].x + 6, itemY + 6, { width: cols[2].w - 12, align: 'right' });
+  doc.text(formatARS(imp), cols[3].x + 6, itemY + 6, { width: cols[3].w - 12, align: 'right' });
 
+  // Totales
+  const totY = itemY + 30;
+  doc.rect(36 + usableW - 200, totY, 200, 45).stroke();
+  doc.fontSize(10).text('Subtotal:', 36 + usableW - 190, totY + 8, { width: 120, align: 'left' });
+  doc.text(formatARS(imp), 36 + usableW - 90, totY + 8, { width: 80, align: 'right' });
+  doc.text('TOTAL:', 36 + usableW - 190, totY + 25, { width: 120, align: 'left' });
+  doc.fontSize(12).text(formatARS(imp), 36 + usableW - 90, totY + 22, { width: 80, align: 'right' });
+
+  // CAE y QR
+  const caeY = totY + 60;
+  const qrSize = 120;
+  // Box CAE
+  doc.rect(36, caeY, usableW - qrSize - 12, qrSize).stroke();
+  doc.fontSize(10)
+     .text(`CAE: ${result.CAE}`, 42, caeY + 12)
+     .text(`Vto CAE: ${result.CAEFchVto}`, 42, doc.y)
+     .text(`Fecha comp.: ${row.fecha}`, 42, doc.y);
+
+  // QR
   const qrUrl = afipQrUrl({
     fechaISO: row.fecha,
     ptoVta: row.pto_vta,
@@ -317,11 +402,11 @@ async function generarPDF({ row, result }) {
   const qrDataURL = await QRCode.toDataURL(qrUrl, { margin: 1, scale: 6 });
   const qrBase64 = qrDataURL.split(',')[1];
   const qrBuffer = Buffer.from(qrBase64, 'base64');
+  doc.image(qrBuffer, 36 + usableW - qrSize, caeY, { width: qrSize, height: qrSize });
 
-  doc.text('Código QR AFIP:');
-  doc.image(qrBuffer, { fit: [120, 120] });
-  doc.moveDown();
-  doc.fontSize(8).fillColor('#555').text(qrUrl);
+  // Pie
+  doc.fontSize(8).fillColor('#666').text(qrUrl, 36, caeY + qrSize + 6);
+  doc.fillColor('#000');
 
   doc.end();
 
@@ -334,17 +419,28 @@ async function generarPDF({ row, result }) {
   return { filePath, fileName };
 }
 
-// Subir PDF a Drive (opcional)
+// Subir PDF a Google Drive (con supportsAllDrives y mejor diagnóstico)
 async function subirPDFaDrive({ filePath, fileName }) {
   if (!DRIVE_FOLDER_ID) return null;
   const fileMeta = { name: fileName, parents: [DRIVE_FOLDER_ID] };
   const media = { mimeType: 'application/pdf', body: fs.createReadStream(filePath) };
-  const res = await withTimeout(
-    drive.files.create({ requestBody: fileMeta, media, fields: 'id, webViewLink, webContentLink' }),
-    DRIVE_TIMEOUT_MS,
-    'Drive upload'
-  );
-  return res.data;
+  try {
+    const res = await withTimeout(
+      drive.files.create({
+        requestBody: fileMeta,
+        media,
+        fields: 'id, webViewLink, webContentLink, parents',
+        supportsAllDrives: true
+      }),
+      DRIVE_TIMEOUT_MS,
+      'Drive upload'
+    );
+    return res.data;
+  } catch (e) {
+    const msg = 'Drive: ' + humanError(e);
+    console.error('[DRIVE_UPLOAD]', msg);
+    throw new Error(msg);
+  }
 }
 
 async function emitirFactura(row) {
@@ -483,7 +579,7 @@ bot.on('message', async (msg) => {
 
     await sendTgMessage(chatId, `🧾 AFIP respondió. Generando PDF… (CAE ${result.CAE})`);
 
-    // 3) PDF y envío (con timeout global de construcción)
+    // 3) PDF y envío (con timeout global)
     let pdfInfo;
     try {
       pdfInfo = await withTimeout(generarPDF({ row: result.norm || parsed, result }), PDF_TIMEOUT_MS, 'PDF build');
@@ -504,10 +600,11 @@ bot.on('message', async (msg) => {
         const driveFile = await withTimeout(subirPDFaDrive(pdfInfo || {}), DRIVE_TIMEOUT_MS, 'Drive upload wrapper');
         if (driveFile?.webViewLink) {
           await sendTgMessage(chatId, `📄 Guardé una copia en Drive: ${driveFile.webViewLink}`);
+        } else {
+          await sendTgMessage(chatId, '⚠️ Subí el archivo pero no recibí link (revisá permisos de la carpeta).');
         }
       } catch (e) {
-        logError('DRIVE', e);
-        await sendTgMessage(chatId, '⚠️ No pude subir a Drive, pero la factura fue emitida.');
+        await sendTgMessage(chatId, '⚠️ No pude subir a Drive: ' + humanError(e));
       }
     }
 
