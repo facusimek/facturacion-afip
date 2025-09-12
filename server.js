@@ -13,11 +13,14 @@ const fs = require('fs');
 const path = require('path');
 const PDFDocument = require('pdfkit');
 const QRCode = require('qrcode');
+const https = require('https');
 
 // ====== CONFIG ======
 const PORT = process.env.PORT || 3000;
 const SHEET_ID = process.env.SHEET_ID;
-const SHEET_NAME = process.env.SHEET_NAME || 'Hoja 1';
+const SHEET_NAME = process.env.SHEET_NAME || 'Hoja 1'; // hoja de facturas
+const PACIENTES_SHEET_NAME = process.env.PACIENTES_SHEET_NAME || 'Pacientes'; // hoja base de datos
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
@@ -39,6 +42,8 @@ const EM_DOM     = process.env.EMISOR_DOMICILIO || '';
 const EM_RESPIVA = process.env.EMISOR_RESP_IVA || 'Monotributista';
 const EM_IIBB    = process.env.EMISOR_IIBB || '';
 const EM_INI     = process.env.EMISOR_INICIO_ACT || '';
+const EM_LOGO_BASE64 = process.env.EMISOR_LOGO_BASE64 || ''; // PNG/JPG en base64 (sin data:)
+const EM_LOGO_URL    = process.env.EMISOR_LOGO_URL || '';    // URL pública https a imagen
 
 // Timeouts (ms)
 const TG_TIMEOUT_MS = 12000;
@@ -78,7 +83,6 @@ function withTimeout(promise, ms, label='OP') {
     new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timeout a ${ms}ms`)), ms))
   ]);
 }
-
 // ---- Montos AR: "5.000,50" | "5000.50" | "5,000.50" → número ----
 function parseMonto(str) {
   if (typeof str !== 'string') str = String(str ?? '');
@@ -91,7 +95,6 @@ function parseMonto(str) {
   }
   return Number(s.replace(/[^0-9.]/g, ''));
 }
-
 // ---- CUIT válido (módulo 11) ----
 function esCUITValido(cuit) {
   const s = String(cuit || '').replace(/\D/g, '');
@@ -104,13 +107,43 @@ function esCUITValido(cuit) {
   if (dv === 10) dv = 9;
   return dv === parseInt(s[10],10);
 }
+const onlyDigits = s => String(s || '').replace(/\D/g, '');
+
+// === Cargar LOGO (buffer) ===
+let _logoTried = false;
+let _logoBuffer = null;
+function fetchBinary(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+      const chunks = [];
+      res.on('data', d => chunks.push(d));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    }).on('error', reject);
+  });
+}
+async function getLogoBuffer() {
+  if (_logoTried) return _logoBuffer;
+  _logoTried = true;
+  try {
+    if (EM_LOGO_BASE64) {
+      _logoBuffer = Buffer.from(EM_LOGO_BASE64, 'base64');
+    } else if (EM_LOGO_URL) {
+      _logoBuffer = await fetchBinary(EM_LOGO_URL);
+    }
+  } catch (e) {
+    logError('LOGO_LOAD', e);
+    _logoBuffer = null;
+  }
+  return _logoBuffer;
+}
 
 // ====== GOOGLE CLIENTS ======
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SA_JSON),
   scopes: [
     'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive.file' // subir PDFs si querés
+    'https://www.googleapis.com/auth/drive.file'
   ]
 });
 const sheets = google.sheets({ version: 'v4', auth });
@@ -173,6 +206,7 @@ app.get('/diag/sheets', async (_, res) => {
       cliente_nombre: 'TEST',
       doc_tipo: 'DNI',
       doc_nro: '12345678',
+      domicilio: 'Calle Test 123',
       concepto: 2,
       detalle: 'ping',
       total: 1,
@@ -221,67 +255,25 @@ app.get('/diag/whoami', async (_, res) => {
   }
 });
 
-// ====== LÓGICA ======
-function parseMessage(text) {
-  const parts = text.split('|').map(s => s.trim());
-  if (parts.length < 4) return null;
-  const [nombre, docCampo, detalle, totalStr] = parts;
-
-  let doc_tipo = 'DNI';
-  let doc_nro = '';
-  const m1 = docCampo.match(/(DNI|CUIT)\s*(\d+)/i);
-  if (m1) {
-    doc_tipo = m1[1].toUpperCase();
-    doc_nro = m1[2];
-  } else {
-    doc_nro = docCampo.replace(/\D/g, '');
-  }
-
-  const total = parseMonto(totalStr);
-  return {
-    fecha: new Date().toISOString().slice(0,10),
-    cliente_nombre: nombre,
-    doc_tipo,
-    doc_nro,
-    concepto: 2, // solo servicios
-    detalle,
-    total,
-    pto_vta: AFIP_PTO_VTA,
-    cbte_tipo: AFIP_CBTE_TIPO
-  };
-}
-
-// Normaliza receptor para evitar rechazos típicos
-function normalizarReceptor(row) {
-  const r = { ...row };
-  const dt = (r.doc_tipo || '').toUpperCase();
-
-  if (dt === 'CUIT') {
-    const n = String(r.doc_nro || '').replace(/\D/g, '');
-    if (!esCUITValido(n)) { r.doc_tipo = 'CF'; r.doc_nro = '0'; }
-    else { r.doc_nro = n; }
-  } else if (dt === 'DNI') {
-    const n = String(r.doc_nro || '').replace(/\D/g, '');
-    if (n.length < 7 || n.length > 8) { r.doc_tipo = 'CF'; r.doc_nro = '0'; }
-    else { r.doc_nro = n; }
-  } else {
-    r.doc_tipo = 'CF'; r.doc_nro = '0';
-  }
-  return r;
-}
-
+// ====== SHEETS: FACTURAS ======
 async function appendRow(row) {
+  // Estructura clásica A..N; agregamos Domicilio en O (15° campo)
   const values = [[
-    row.fecha,
-    row.cliente_nombre,
-    row.doc_tipo,
-    row.doc_nro,
-    row.concepto,
-    row.detalle,
-    row.total,
-    row.pto_vta,
-    row.cbte_tipo,
-    'PENDIENTE', '', '', '', ''
+    row.fecha,            // A
+    row.cliente_nombre,   // B
+    row.doc_tipo,         // C
+    row.doc_nro,          // D
+    row.concepto,         // E (se mantiene)
+    row.detalle,          // F
+    row.total,            // G
+    row.pto_vta,          // H
+    row.cbte_tipo,        // I
+    'PENDIENTE',          // J
+    '',                   // K (CAE)
+    '',                   // L (CAE Vto)
+    '',                   // M (Nro)
+    '',                   // N (Error)
+    row.domicilio || ''   // O (DOMICILIO) ← NUEVO
   ]];
   return sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
@@ -290,13 +282,137 @@ async function appendRow(row) {
     requestBody: { values }
   });
 }
+async function updateLastRowWithResult(result) {
+  const get = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:Z`
+  });
+  const rows = get.data.values || [];
+  for (let i = rows.length - 1; i >= 1; i--) {
+    if (rows[i][9] === 'PENDIENTE') { // J = estado
+      const rowIndex = i + 1;
+      const updates = [[ 'EMITIDO', result.CAE, result.CAEFchVto, result.voucher_number, '' ]];
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: `${SHEET_NAME}!J${rowIndex}:N${rowIndex}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: updates }
+      });
+      return rowIndex;
+    }
+  }
+}
+// Marca la última fila PENDIENTE como ERROR y escribe el motivo en col N
+async function markLastRowError(errMsg) {
+  const get = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:Z`
+  });
+  const rows = get.data.values || [];
+  for (let i = rows.length - 1; i >= 1; i--) {
+    if (rows[i][9] === 'PENDIENTE') {
+      const rowIndex = i + 1;
+      const updates = [[ 'ERROR', '', '', '', String(errMsg).slice(0, 500) ]];
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: `${SHEET_NAME}!J${rowIndex}:N${rowIndex}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: updates }
+      });
+      return rowIndex;
+    }
+  }
+}
+
+// ====== SHEETS: PACIENTES (base de datos) ======
+async function getPacientesSheetRows() {
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${PACIENTES_SHEET_NAME}!A:Z`
+  });
+  return resp.data.values || [];
+}
+async function getPacientePorDoc(doc_nro) {
+  const rows = await getPacientesSheetRows();
+  for (let i = 1; i < rows.length; i++) { // salteo encabezado
+    const [nombre, doc_tipo, doc_nro2, domicilio, email] = rows[i];
+    if (onlyDigits(doc_nro2) === onlyDigits(doc_nro)) {
+      return { nombre, doc_tipo, doc_nro: onlyDigits(doc_nro2), domicilio, email, rowIndex: i + 1 };
+    }
+  }
+  return null;
+}
+async function upsertPaciente({ nombre, doc_tipo, doc_nro, domicilio, email }) {
+  const rows = await getPacientesSheetRows();
+  let rowIndex = -1;
+  for (let i = 1; i < rows.length; i++) {
+    if (onlyDigits(rows[i][2]) === onlyDigits(doc_nro)) { rowIndex = i + 1; break; }
+  }
+  const values = [[
+    nombre,
+    (doc_tipo || '').toUpperCase(),
+    onlyDigits(doc_nro),
+    domicilio || '',
+    email || ''
+  ]];
+  if (rowIndex > 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `${PACIENTES_SHEET_NAME}!A${rowIndex}:E${rowIndex}`,
+      valueInputOption: 'RAW',
+      requestBody: { values }
+    });
+    return rowIndex;
+  } else {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: `${PACIENTES_SHEET_NAME}!A:E`,
+      valueInputOption: 'RAW',
+      requestBody: { values }
+    });
+    return 'APPENDED';
+  }
+}
+async function buscarPacientes(q) {
+  q = String(q || '').toLowerCase();
+  const qDigits = onlyDigits(q);
+  const rows = await getPacientesSheetRows();
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const [nombre, doc_tipo, doc_nro, domicilio, email] = rows[i];
+    const nd = onlyDigits(doc_nro);
+    if (nombre?.toLowerCase().includes(q) || nd.includes(qDigits)) {
+      out.push({ nombre, doc_tipo, doc_nro: nd, domicilio, email });
+      if (out.length >= 10) break;
+    }
+  }
+  return out;
+}
+
+// Estado en memoria por chat (paciente activo)
+const activePatientByChat = new Map();
+
+// Completa datos desde "Pacientes" por documento o paciente activo del chat
+async function completarPaciente(row, chatId) {
+  let pac = null;
+  if (row.doc_nro) pac = await getPacientePorDoc(row.doc_nro);
+  if (!pac && activePatientByChat.has(chatId)) pac = activePatientByChat.get(chatId);
+  if (pac) {
+    row.cliente_nombre = pac.nombre || row.cliente_nombre || '';
+    row.doc_tipo = pac.doc_tipo || row.doc_tipo;
+    row.doc_nro = pac.doc_nro || row.doc_nro;
+    row.domicilio = pac.domicilio || '';
+  }
+  return row;
+}
+
+// ====== AFIP helpers ======
 function docTipoCode(t) {
   const u = String(t || '').toUpperCase();
   if (u === 'CUIT') return 80;
   if (u === 'DNI') return 96;
   return 99; // CF / desconocido
 }
-
 // Condición IVA del receptor (RG 5616)
 function getCondicionIVAReceptorId(parsed) {
   const u = (parsed.doc_tipo || '').toUpperCase();
@@ -304,7 +420,6 @@ function getCondicionIVAReceptorId(parsed) {
   const def = Number(process.env.IVA_COND_RECEPTOR_ID_DEFAULT || '6'); // 6=Monotributo
   return def;
 }
-
 // QR AFIP (RG 4892)
 function afipQrUrl({ fechaISO, ptoVta, tipoCmp, nroCmp, importe, tipoDocRec, nroDocRec, cae }) {
   const payload = {
@@ -326,7 +441,6 @@ function afipQrUrl({ fechaISO, ptoVta, tipoCmp, nroCmp, importe, tipoDocRec, nro
     .toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   return 'https://www.afip.gob.ar/fe/qr/?p=' + base64url;
 }
-
 function formatARS(n) {
   const v = Number(n || 0);
   return '$ ' + v.toFixed(2)
@@ -334,7 +448,44 @@ function formatARS(n) {
     .replace(/\B(?=(\d{3})+(?!\d))/g, '.');
 }
 
-// ====== PDF legible + FIX de finalización ======
+// ====== Parseo del mensaje de facturación ======
+function parseMessage(text) {
+  const parts = text.split('|').map(s => s.trim()).filter(Boolean);
+  if (parts.length < 3) return null;
+
+  let nombre = '';
+  let docCampo = '', detalle = '', totalStr = '';
+
+  if (parts.length === 4) {
+    [nombre, docCampo, detalle, totalStr] = parts;
+  } else { // 3 partes: DOC | Detalle | Total
+    [docCampo, detalle, totalStr] = parts;
+  }
+
+  // Detecta DNI/CUIT en docCampo
+  let doc_tipo = 'DNI';
+  let doc_nro = '';
+  const m1 = docCampo.match(/(DNI|CUIT)\s*(\d+)/i);
+  if (m1) { doc_tipo = m1[1].toUpperCase(); doc_nro = m1[2]; }
+  else { doc_nro = docCampo.replace(/\D/g, ''); }
+
+  const total = parseMonto(totalStr);
+
+  return {
+    fecha: new Date().toISOString().slice(0,10),
+    cliente_nombre: nombre, // puede venir vacío: lo completa la base
+    doc_tipo,
+    doc_nro,
+    domicilio: '', // puede completar luego
+    concepto: 2, // solo servicios
+    detalle,
+    total,
+    pto_vta: AFIP_PTO_VTA,
+    cbte_tipo: AFIP_CBTE_TIPO
+  };
+}
+
+// ====== PDF legible (con LOGO) ======
 async function generarPDF({ row, result }) {
   const fileName = `Factura_C_${String(row.pto_vta).padStart(4,'0')}-${String(result.voucher_number).padStart(8,'0')}.pdf`;
   const filePath = path.join('/tmp', fileName);
@@ -346,13 +497,22 @@ async function generarPDF({ row, result }) {
   const usableW = doc.page.width - 72;      // ancho útil (margen 36)
   const startY = 36;
 
-  // Header: letra C
+  // Letra del comprobante (C)
   doc.rect(36, startY, 40, 40).stroke();
   doc.fontSize(24).text('C', 36, startY + 7, { width: 40, align: 'center' });
 
-  // Datos emisor
+  // Logo + Datos emisor
   const emX = 36 + 50;
-  doc.fontSize(12).text(EM_NOMBRE, emX, startY);
+  let emY = startY;
+  try {
+    const logoBuf = await getLogoBuffer();
+    if (logoBuf) {
+      doc.image(logoBuf, emX, emY, { fit: [140, 40] });
+      emY += 44; // debajo del logo
+    }
+  } catch (e) { /* ignorar logo */ }
+
+  doc.fontSize(12).text(EM_NOMBRE, emX, emY);
   doc.fontSize(9).fillColor('#333');
   if (EM_DOM)       doc.text(EM_DOM, emX, doc.y);
   doc.text(`CUIT: ${AFIP_CUIT}   |   Resp. IVA: ${EM_RESPIVA}`, emX, doc.y);
@@ -369,15 +529,16 @@ async function generarPDF({ row, result }) {
   doc.text(`Fecha: ${row.fecha}`, compX + 8, doc.y);
 
   doc.moveDown(0.5);
-  // Receptor box
-  const recY = compY + 50;
-  doc.rect(36, recY, usableW, 60).stroke();
-  doc.fontSize(10).text(`Receptor: ${row.cliente_nombre}`, 42, recY + 6);
+  // Receptor (Paciente)
+  const recY = Math.max(compY + 50, doc.y + 8);
+  doc.rect(36, recY, usableW, 80).stroke();
+  doc.fontSize(10).text(`Paciente: ${row.cliente_nombre || '-'}`, 42, recY + 6);
   doc.text(`Documento: ${(row.doc_tipo || '-').toUpperCase()} ${row.doc_nro || '-'}`, 42, doc.y);
+  doc.text(`Domicilio: ${row.domicilio || '-'}`, 42, doc.y);
   doc.text(`Cond. IVA: ${(row.doc_tipo || '').toUpperCase() === 'CUIT' ? (process.env.IVA_COND_RECEPTOR_ID_DEFAULT ? 'Resp. Inscripto/Monotributo' : 'CUIT') : 'Consumidor Final'}`, 42, doc.y);
 
   // Ítems (simple: 1 renglón con el detalle)
-  const tableY = recY + 70;
+  const tableY = recY + 90;
   const cols = [
     { title: 'Descripción', x: 36, w: usableW - 200 },
     { title: 'Cant.', x: 36 + (usableW - 200), w: 50, align: 'right' },
@@ -453,7 +614,7 @@ async function generarPDF({ row, result }) {
 // Subir PDF a Google Drive (usa OAuth si está disponible)
 async function subirPDFaDrive({ filePath, fileName }) {
   if (!DRIVE_FOLDER_ID) return null;
-  const drv = driveUser || drive; // <— usa OAuth del usuario si existe
+  const drv = driveUser || drive; // usa OAuth del usuario si existe
 
   const fileMeta = { name: fileName, parents: [DRIVE_FOLDER_ID] };
   const media = { mimeType: 'application/pdf', body: fs.createReadStream(filePath) };
@@ -476,6 +637,8 @@ async function subirPDFaDrive({ filePath, fileName }) {
   }
 }
 
+// ====== AFIP ======
+function docTipoCodeFromRow(row) { return docTipoCode(row.doc_tipo); }
 async function emitirFactura(row) {
   const norm = normalizarReceptor(row);
   const cbteFch = toYYYYMMDD(norm.fecha);
@@ -485,7 +648,7 @@ async function emitirFactura(row) {
     PtoVta: Number(norm.pto_vta),
     CbteTipo: Number(norm.cbte_tipo),   // 11 = Factura C
     Concepto: Number(norm.concepto),    // 2 = Servicios
-    DocTipo: docTipoCode(norm.doc_tipo),
+    DocTipo: docTipoCodeFromRow(norm),
     DocNro: Number(norm.doc_nro),
     CbteFch: cbteFch,
     ImpTotal: Number(norm.total),
@@ -516,53 +679,109 @@ async function emitirFactura(row) {
   return { CAE: res.CAE, CAEFchVto: res.CAEFchVto, voucher_number: res.voucher_number, norm };
 }
 
-async function updateLastRowWithResult(result) {
-  const get = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:Z`
-  });
-  const rows = get.data.values || [];
-  for (let i = rows.length - 1; i >= 1; i--) {
-    if (rows[i][9] === 'PENDIENTE') {
-      const rowIndex = i + 1;
-      const updates = [[ 'EMITIDO', result.CAE, result.CAEFchVto, result.voucher_number, '' ]];
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
-        range: `${SHEET_NAME}!J${rowIndex}:N${rowIndex}`,
-        valueInputOption: 'RAW',
-        requestBody: { values: updates }
-      });
-      return rowIndex;
-    }
+// Normaliza receptor para evitar rechazos típicos
+function normalizarReceptor(row) {
+  const r = { ...row };
+  const dt = (r.doc_tipo || '').toUpperCase();
+
+  if (dt === 'CUIT') {
+    const n = String(r.doc_nro || '').replace(/\D/g, '');
+    if (!esCUITValido(n)) { r.doc_tipo = 'CF'; r.doc_nro = '0'; }
+    else { r.doc_nro = n; }
+  } else if (dt === 'DNI') {
+    const n = String(r.doc_nro || '').replace(/\D/g, '');
+    if (n.length < 7 || n.length > 8) { r.doc_tipo = 'CF'; r.doc_nro = '0'; }
+    else { r.doc_nro = n; }
+  } else {
+    r.doc_tipo = 'CF'; r.doc_nro = '0';
   }
+  return r;
 }
 
-// Marca la última fila PENDIENTE como ERROR y escribe el motivo en col N
-async function markLastRowError(errMsg) {
-  const get = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:Z`
-  });
-  const rows = get.data.values || [];
-  for (let i = rows.length - 1; i >= 1; i--) {
-    if (rows[i][9] === 'PENDIENTE') {
-      const rowIndex = i + 1;
-      const updates = [[ 'ERROR', '', '', '', String(errMsg).slice(0, 500) ]];
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
-        range: `${SHEET_NAME}!J${rowIndex}:N${rowIndex}`,
-        valueInputOption: 'RAW',
-        requestBody: { values: updates }
-      });
-      return rowIndex;
-    }
-  }
-}
+// ====== COMANDOS TELEGRAM (PACIENTES) ======
 
-// ====== TELEGRAM HANDLER ======
+// /paciente_guardar Nombre | DNI/CUIT NNN | Domicilio
+bot.onText(/^\/paciente_guardar\s+(.+)$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  try {
+    const parts = match[1].split('|').map(s => s.trim());
+    if (parts.length < 3) {
+      await sendTgMessage(chatId, 'Uso: /paciente_guardar Nombre | DNI o CUIT NNN | Domicilio');
+      return;
+    }
+    const [nombre, docCampo, domicilio] = parts;
+    const m = docCampo.match(/(DNI|CUIT)\s*(\d+)/i);
+    const doc_tipo = (m?.[1] || 'DNI').toUpperCase();
+    const doc_nro = (m?.[2] || docCampo).replace(/\D/g, '');
+    await upsertPaciente({ nombre, doc_tipo, doc_nro, domicilio });
+    await sendTgMessage(chatId, `✅ Paciente guardado: ${nombre} (${doc_tipo} ${doc_nro})`);
+  } catch (e) {
+    await sendTgMessage(chatId, '❌ No pude guardar: ' + humanError(e));
+  }
+});
+
+// /paciente_buscar texto
+bot.onText(/^\/paciente_buscar\s+(.+)$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  try {
+    const q = match[1];
+    const res = await buscarPacientes(q);
+    if (!res.length) {
+      await sendTgMessage(chatId, 'Sin resultados. Probá con parte del nombre o el número de documento.');
+      return;
+    }
+    const keyboard = res.map(c => [{ text: `${c.nombre} (${c.doc_tipo} ${c.doc_nro})`, callback_data: 'use:' + c.doc_nro }]);
+    await bot.sendMessage(chatId, 'Elegí un paciente:', { reply_markup: { inline_keyboard: keyboard } });
+  } catch (e) {
+    await sendTgMessage(chatId, '❌ Error buscando: ' + humanError(e));
+  }
+});
+
+// /paciente_usar NNNNN
+bot.onText(/^\/paciente_usar\s+(.+)$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const doc = match[1].replace(/\D/g, '');
+  const pac = await getPacientePorDoc(doc);
+  if (!pac) { await sendTgMessage(chatId, 'No encontré ese documento en Pacientes.'); return; }
+  activePatientByChat.set(chatId, pac);
+  await sendTgMessage(chatId, `✅ Paciente activo: ${pac.nombre} (${pac.doc_tipo} ${pac.doc_nro})`);
+});
+
+// /paciente_actual
+bot.onText(/^\/paciente_actual$/i, async (msg) => {
+  const chatId = msg.chat.id;
+  const pac = activePatientByChat.get(chatId);
+  if (!pac) { await sendTgMessage(chatId, 'No hay paciente activo. Usá /paciente_buscar o /paciente_usar.'); return; }
+  await sendTgMessage(chatId, `Paciente activo: ${pac.nombre}\nDoc: ${pac.doc_tipo} ${pac.doc_nro}\nDomicilio: ${pac.domicilio || '-'}`);
+});
+
+// Botones inline: seleccionar paciente
+bot.on('callback_query', async (cbq) => {
+  try {
+    const chatId = cbq.message.chat.id;
+    if (cbq.data?.startsWith('use:')) {
+      const doc = cbq.data.slice(4).replace(/\D/g, '');
+      const pac = await getPacientePorDoc(doc);
+      if (!pac) { await bot.answerCallbackQuery(cbq.id, { text: 'No encontré el paciente.' }); return; }
+      activePatientByChat.set(chatId, pac);
+      await bot.answerCallbackQuery(cbq.id, { text: 'Paciente seleccionado ✅' });
+      await bot.sendMessage(chatId, `Paciente activo: ${pac.nombre} (${pac.doc_tipo} ${pac.doc_nro})`);
+    }
+  } catch (e) {
+    console.error('callback_query', e);
+  }
+});
+
+// ====== HANDLER DE MENSAJES (FACTURACIÓN) ======
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
+
+  if (text === '/start') {
+    await sendTgMessage(chatId, 'Hola! Podés facturar enviando:\n• Con 4 campos: Nombre | DNI o CUIT | Detalle | Total\n• O con 3 campos si ya guardaste al paciente: DNI o CUIT | Detalle | Total\n\nGestión de pacientes:\n/paciente_guardar Nombre | DNI o CUIT NNN | Domicilio\n/paciente_buscar texto\n/paciente_usar NNNNN\n/paciente_actual');
+    return;
+  }
+  if (text.startsWith('/')) return; // otros comandos ya se manejan arriba
 
   // Watchdog: si en 35s no se resolvió, avisamos
   let finished = false;
@@ -573,21 +792,18 @@ bot.on('message', async (msg) => {
   }, 35000);
 
   try {
-    if (text === '/start') {
-      await sendTgMessage(chatId, 'Hola! Enviame: Nombre | DNI o CUIT | Detalle | Total\nEjemplo:\nJuan Perez | DNI 12345678 | Servicio de diseño | 5000');
-      finished = true; clearTimeout(watchdog);
-      return;
-    }
-
     const parsed = parseMessage(text);
     if (!parsed) {
-      await sendTgMessage(chatId, 'Formato incorrecto. Usá: Nombre | DNI o CUIT | Detalle | Total');
+      await sendTgMessage(chatId, 'Formato incorrecto.\nUsá: Nombre | DNI o CUIT | Detalle | Total\nO si ya guardaste al paciente: DNI o CUIT | Detalle | Total');
       finished = true; clearTimeout(watchdog);
       return;
     }
 
-    // 1) Google Sheets
-    try { await appendRow(parsed); }
+    // Completar datos desde "Pacientes" o paciente activo
+    const parsedCompleted = await completarPaciente(parsed, chatId);
+
+    // 1) Google Sheets (facturas)
+    try { await appendRow(parsedCompleted); }
     catch (e) {
       const msgErr = logError('SHEETS_APPEND', e);
       await sendTgMessage(chatId, '❌ Error en Google Sheets: ' + msgErr);
@@ -601,7 +817,7 @@ bot.on('message', async (msg) => {
 
     // 2) AFIP (con timeout)
     let result;
-    try { result = await emitirFactura(parsed); }
+    try { result = await emitirFactura(parsedCompleted); }
     catch (e) {
       const msgErr = logError('AFIP_EMITIR', e);
       await markLastRowError('AFIP: ' + msgErr);
@@ -615,11 +831,11 @@ bot.on('message', async (msg) => {
     // 3) PDF y envío (con timeout global)
     let pdfInfo;
     try {
-      pdfInfo = await withTimeout(generarPDF({ row: result.norm || parsed, result }), PDF_TIMEOUT_MS, 'PDF build');
+      pdfInfo = await withTimeout(generarPDF({ row: result.norm || parsedCompleted, result }), PDF_TIMEOUT_MS, 'PDF build');
       await sendTgDocument(
         chatId,
         pdfInfo.filePath,
-        { caption: `Factura C ${String(parsed.pto_vta).padStart(4,'0')}-${String(result.voucher_number).padStart(8,'0')} | CAE ${result.CAE}` }
+        { caption: `Factura C ${String(parsedCompleted.pto_vta).padStart(4,'0')}-${String(result.voucher_number).padStart(8, '0')} | CAE ${result.CAE}` }
       );
     } catch (e) {
       logError('PDF', e);
@@ -657,7 +873,8 @@ bot.on('message', async (msg) => {
     const msgErr = logError('HANDLER_FATAL', e);
     await markLastRowError('FATAL: ' + msgErr);
     await sendTgMessage(chatId, '❌ Error inesperado: ' + msgErr);
-    finished = true; clearTimeout(watchdog);
+  } finally {
+    try { clearTimeout(watchdog); } catch {}
   }
 });
 
