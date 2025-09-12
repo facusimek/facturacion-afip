@@ -71,6 +71,35 @@ function withTimeout(promise, ms, label='OP') {
   ]);
 }
 
+// ---- Montos AR: "5.000,50" | "5000.50" | "5,000.50" → número ----
+function parseMonto(str) {
+  if (typeof str !== 'string') str = String(str ?? '');
+  const s = str.trim();
+  // si tiene coma y punto, asumimos formato AR "5.000,50"
+  if (s.includes('.') && s.includes(',')) {
+    return Number(s.replace(/\./g, '').replace(',', '.').replace(/[^0-9.]/g, ''));
+  }
+  // si solo tiene coma, tomamos coma como decimal
+  if (s.includes(',') && !s.includes('.')) {
+    return Number(s.replace(/\./g, '').replace(',', '.').replace(/[^0-9.]/g, ''));
+  }
+  // solo punto o dígitos
+  return Number(s.replace(/[^0-9.]/g, ''));
+}
+
+// ---- CUIT válido (módulo 11) ----
+function esCUITValido(cuit) {
+  const s = String(cuit || '').replace(/\D/g, '');
+  if (s.length !== 11) return false;
+  const mult = [5,4,3,2,7,6,5,4,3,2];
+  let sum = 0;
+  for (let i=0;i<10;i++) sum += parseInt(s[i],10)*mult[i];
+  let dv = 11 - (sum % 11);
+  if (dv === 11) dv = 0;
+  if (dv === 10) dv = 9;
+  return dv === parseInt(s[10],10);
+}
+
 // ====== GOOGLE CLIENTS ======
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SA_JSON),
@@ -158,7 +187,7 @@ function parseMessage(text) {
     doc_nro = docCampo.replace(/\D/g, '');
   }
 
-  const total = Number(String(totalStr).replace(/[^\d.]/g, ''));
+  const total = parseMonto(totalStr);
   return {
     fecha: new Date().toISOString().slice(0,10),
     cliente_nombre: nombre,
@@ -170,6 +199,37 @@ function parseMessage(text) {
     pto_vta: AFIP_PTO_VTA,
     cbte_tipo: AFIP_CBTE_TIPO
   };
+}
+
+// Normaliza receptor para evitar rechazos típicos
+function normalizarReceptor(row) {
+  const r = { ...row };
+  const dt = (r.doc_tipo || '').toUpperCase();
+
+  if (dt === 'CUIT') {
+    const n = String(r.doc_nro || '').replace(/\D/g, '');
+    if (!esCUITValido(n)) {
+      // si CUIT inválido → Consumidor Final
+      r.doc_tipo = 'CF';
+      r.doc_nro = '0';
+    } else {
+      r.doc_nro = n;
+    }
+  } else if (dt === 'DNI') {
+    const n = String(r.doc_nro || '').replace(/\D/g, '');
+    // DNI típico 7–8 dígitos; si no cumple, CAE a CF
+    if (n.length < 7 || n.length > 8) {
+      r.doc_tipo = 'CF';
+      r.doc_nro = '0';
+    } else {
+      r.doc_nro = n;
+    }
+  } else {
+    // cualquier otro → CF
+    r.doc_tipo = 'CF';
+    r.doc_nro = '0';
+  }
+  return r;
 }
 
 async function appendRow(row) {
@@ -192,11 +252,18 @@ async function appendRow(row) {
     requestBody: { values }
   });
 }
-function docTipoCode(t) { return String(t).toUpperCase() === 'CUIT' ? 80 : 96; } // 80=CUIT, 96=DNI
+function docTipoCode(t) {
+  const u = String(t || '').toUpperCase();
+  if (u === 'CUIT') return 80;
+  if (u === 'DNI') return 96;
+  // CF / desconocido
+  return 99;
+}
 
 // Condición IVA del receptor (RG 5616)
 function getCondicionIVAReceptorId(parsed) {
-  if (parsed.doc_tipo === 'DNI') return 5; // Consumidor Final
+  const u = (parsed.doc_tipo || '').toUpperCase();
+  if (u === 'DNI' || u === 'CF') return 5; // Consumidor Final para DNI/CF
   const def = Number(process.env.IVA_COND_RECEPTOR_ID_DEFAULT || '6'); // 6=Monotributo
   return def;
 }
@@ -257,7 +324,7 @@ async function generarPDF({ row, result }) {
     tipoCmp: row.cbte_tipo,
     nroCmp: result.voucher_number,
     importe: row.total,
-    tipoDocRec: (row.doc_tipo || '').toUpperCase() === 'CUIT' ? 80 : 96,
+    tipoDocRec: (row.doc_tipo || '').toUpperCase() === 'CUIT' ? 80 : (row.doc_tipo || '').toUpperCase() === 'DNI' ? 96 : 99,
     nroDocRec: row.doc_nro,
     cae: result.CAE
   });
@@ -289,24 +356,25 @@ async function subirPDFaDrive({ filePath, fileName }) {
 }
 
 async function emitirFactura(row) {
-  const cbteFch = toYYYYMMDD(row.fecha);
+  const norm = normalizarReceptor(row);
+  const cbteFch = toYYYYMMDD(norm.fecha);
 
   const data = {
     CantReg: 1,
-    PtoVta: Number(row.pto_vta),
-    CbteTipo: Number(row.cbte_tipo),   // 11 = Factura C
-    Concepto: Number(row.concepto),    // 2 = Servicios
-    DocTipo: docTipoCode(row.doc_tipo),
-    DocNro: Number(row.doc_nro),
+    PtoVta: Number(norm.pto_vta),
+    CbteTipo: Number(norm.cbte_tipo),   // 11 = Factura C
+    Concepto: Number(norm.concepto),    // 2 = Servicios
+    DocTipo: docTipoCode(norm.doc_tipo),
+    DocNro: Number(norm.doc_nro),
     CbteFch: cbteFch,
-    ImpTotal: Number(row.total),
+    ImpTotal: Number(norm.total),
     ImpTotConc: 0,
-    ImpNeto: Number(row.total),
+    ImpNeto: Number(norm.total),
     ImpIVA: 0,
     ImpTrib: 0,
     MonId: 'PES',
     MonCotiz: 1,
-    CondicionIVAReceptorId: getCondicionIVAReceptorId(row)
+    CondicionIVAReceptorId: getCondicionIVAReceptorId(norm)
     // NO enviar "Iva" en Factura C
   };
 
@@ -316,7 +384,7 @@ async function emitirFactura(row) {
     data.FchVtoPago   = cbteFch;
   }
 
-  console.log('AFIP createNextVoucher START');
+  console.log('AFIP createNextVoucher START', { DocTipo: data.DocTipo, DocNro: data.DocNro, Total: data.ImpTotal });
   const res = await withTimeout(
     afip.ElectronicBilling.createNextVoucher(data),
     AFIP_TIMEOUT_MS,
@@ -324,7 +392,7 @@ async function emitirFactura(row) {
   );
   console.log('AFIP createNextVoucher DONE');
 
-  return { CAE: res.CAE, CAEFchVto: res.CAEFchVto, voucher_number: res.voucher_number };
+  return { CAE: res.CAE, CAEFchVto: res.CAEFchVto, voucher_number: res.voucher_number, norm };
 }
 
 async function updateLastRowWithResult(result) {
@@ -337,6 +405,28 @@ async function updateLastRowWithResult(result) {
     if (rows[i][9] === 'PENDIENTE') {
       const rowIndex = i + 1;
       const updates = [[ 'EMITIDO', result.CAE, result.CAEFchVto, result.voucher_number, '' ]];
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: `${SHEET_NAME}!J${rowIndex}:N${rowIndex}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: updates }
+      });
+      return rowIndex;
+    }
+  }
+}
+
+// Marca la última fila PENDIENTE como ERROR y escribe el motivo en col N
+async function markLastRowError(errMsg) {
+  const get = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:Z`
+  });
+  const rows = get.data.values || [];
+  for (let i = rows.length - 1; i >= 1; i--) {
+    if (rows[i][9] === 'PENDIENTE') {
+      const rowIndex = i + 1;
+      const updates = [[ 'ERROR', '', '', '', String(errMsg).slice(0, 500) ]];
       await sheets.spreadsheets.values.update({
         spreadsheetId: SHEET_ID,
         range: `${SHEET_NAME}!J${rowIndex}:N${rowIndex}`,
@@ -393,6 +483,7 @@ bot.on('message', async (msg) => {
     try { result = await emitirFactura(parsed); }
     catch (e) {
       const msgErr = logError('AFIP_EMITIR', e);
+      await markLastRowError('AFIP: ' + msgErr);
       await sendTgMessage(chatId, '❌ Error en AFIP: ' + msgErr);
       finished = true; clearTimeout(watchdog);
       return;
@@ -403,7 +494,7 @@ bot.on('message', async (msg) => {
     // 3) PDF y envío
     let pdfInfo;
     try {
-      pdfInfo = await generarPDF({ row: parsed, result });
+      pdfInfo = await generarPDF({ row: result.norm || parsed, result });
       await sendTgDocument(
         chatId,
         pdfInfo.filePath,
@@ -442,6 +533,7 @@ bot.on('message', async (msg) => {
     finished = true; clearTimeout(watchdog);
   } catch (e) {
     const msgErr = logError('HANDLER_FATAL', e);
+    await markLastRowError('FATAL: ' + msgErr);
     await sendTgMessage(chatId, '❌ Error inesperado: ' + msgErr);
     finished = true; clearTimeout(watchdog);
   }
