@@ -37,6 +37,7 @@ const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
 const TG_TIMEOUT_MS = 12000;
 const AFIP_TIMEOUT_MS = 20000;
 const DRIVE_TIMEOUT_MS = 15000;
+const PDF_TIMEOUT_MS = 12000;
 
 // ====== HELPERS ======
 function humanError(e) {
@@ -75,15 +76,12 @@ function withTimeout(promise, ms, label='OP') {
 function parseMonto(str) {
   if (typeof str !== 'string') str = String(str ?? '');
   const s = str.trim();
-  // si tiene coma y punto, asumimos formato AR "5.000,50"
   if (s.includes('.') && s.includes(',')) {
     return Number(s.replace(/\./g, '').replace(',', '.').replace(/[^0-9.]/g, ''));
   }
-  // si solo tiene coma, tomamos coma como decimal
   if (s.includes(',') && !s.includes('.')) {
     return Number(s.replace(/\./g, '').replace(',', '.').replace(/[^0-9.]/g, ''));
   }
-  // solo punto o dígitos
   return Number(s.replace(/[^0-9.]/g, ''));
 }
 
@@ -208,26 +206,14 @@ function normalizarReceptor(row) {
 
   if (dt === 'CUIT') {
     const n = String(r.doc_nro || '').replace(/\D/g, '');
-    if (!esCUITValido(n)) {
-      // si CUIT inválido → Consumidor Final
-      r.doc_tipo = 'CF';
-      r.doc_nro = '0';
-    } else {
-      r.doc_nro = n;
-    }
+    if (!esCUITValido(n)) { r.doc_tipo = 'CF'; r.doc_nro = '0'; }
+    else { r.doc_nro = n; }
   } else if (dt === 'DNI') {
     const n = String(r.doc_nro || '').replace(/\D/g, '');
-    // DNI típico 7–8 dígitos; si no cumple, CAE a CF
-    if (n.length < 7 || n.length > 8) {
-      r.doc_tipo = 'CF';
-      r.doc_nro = '0';
-    } else {
-      r.doc_nro = n;
-    }
+    if (n.length < 7 || n.length > 8) { r.doc_tipo = 'CF'; r.doc_nro = '0'; }
+    else { r.doc_nro = n; }
   } else {
-    // cualquier otro → CF
-    r.doc_tipo = 'CF';
-    r.doc_nro = '0';
+    r.doc_tipo = 'CF'; r.doc_nro = '0';
   }
   return r;
 }
@@ -256,14 +242,13 @@ function docTipoCode(t) {
   const u = String(t || '').toUpperCase();
   if (u === 'CUIT') return 80;
   if (u === 'DNI') return 96;
-  // CF / desconocido
-  return 99;
+  return 99; // CF / desconocido
 }
 
 // Condición IVA del receptor (RG 5616)
 function getCondicionIVAReceptorId(parsed) {
   const u = (parsed.doc_tipo || '').toUpperCase();
-  if (u === 'DNI' || u === 'CF') return 5; // Consumidor Final para DNI/CF
+  if (u === 'DNI' || u === 'CF') return 5; // Consumidor Final
   const def = Number(process.env.IVA_COND_RECEPTOR_ID_DEFAULT || '6'); // 6=Monotributo
   return def;
 }
@@ -290,13 +275,14 @@ function afipQrUrl({ fechaISO, ptoVta, tipoCmp, nroCmp, importe, tipoDocRec, nro
   return 'https://www.afip.gob.ar/fe/qr/?p=' + base64url;
 }
 
-// PDF con QR
+// ====== FIX: PDF con QR (escuchar 'finish' en el stream) ======
 async function generarPDF({ row, result }) {
   const fileName = `Factura_C_${String(row.pto_vta).padStart(4,'0')}-${String(result.voucher_number).padStart(8,'0')}.pdf`;
   const filePath = path.join('/tmp', fileName);
 
   const doc = new PDFDocument({ size: 'A4', margin: 36 });
-  doc.pipe(fs.createWriteStream(filePath));
+  const out = fs.createWriteStream(filePath);
+  doc.pipe(out);
 
   doc.fontSize(18).text('FACTURA C', { align: 'center' });
   doc.moveDown(0.5);
@@ -338,7 +324,13 @@ async function generarPDF({ row, result }) {
   doc.fontSize(8).fillColor('#555').text(qrUrl);
 
   doc.end();
-  await new Promise(res => doc.on('finish', res));
+
+  await new Promise((resolve, reject) => {
+    out.on('finish', resolve);
+    out.on('error', reject);
+    doc.on('error', reject);
+  });
+
   return { filePath, fileName };
 }
 
@@ -489,12 +481,12 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    await sendTgMessage(chatId, '🧾 AFIP respondió. Generando PDF…');
+    await sendTgMessage(chatId, `🧾 AFIP respondió. Generando PDF… (CAE ${result.CAE})`);
 
-    // 3) PDF y envío
+    // 3) PDF y envío (con timeout global de construcción)
     let pdfInfo;
     try {
-      pdfInfo = await generarPDF({ row: result.norm || parsed, result });
+      pdfInfo = await withTimeout(generarPDF({ row: result.norm || parsed, result }), PDF_TIMEOUT_MS, 'PDF build');
       await sendTgDocument(
         chatId,
         pdfInfo.filePath,
